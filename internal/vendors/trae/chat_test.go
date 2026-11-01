@@ -442,7 +442,7 @@ func TestPrepareBodySerializesToolParameters(t *testing.T) {
 		check func(t *testing.T, fn map[string]any)
 	}{
 		"对象参数序列化": {
-			tool:  `{"type":"function","function":{"name":"get_weather","description":"查天气","parameters":{"type":"object","properties":{"city":{"type":"string"}}}}}`,
+			tool: `{"type":"function","function":{"name":"get_weather","description":"查天气","parameters":{"type":"object","properties":{"city":{"type":"string"}}}}}`,
 			check: func(t *testing.T, fn map[string]any) {
 				p, ok := fn["parameters"].(string)
 				if !ok {
@@ -460,7 +460,7 @@ func TestPrepareBodySerializesToolParameters(t *testing.T) {
 			},
 		},
 		"字符串参数透传": {
-			tool:  `{"type":"function","function":{"name":"get_weather","description":"查天气","parameters":"{\"type\":\"object\"}"}}`,
+			tool: `{"type":"function","function":{"name":"get_weather","description":"查天气","parameters":"{\"type\":\"object\"}"}}`,
 			check: func(t *testing.T, fn map[string]any) {
 				if p, _ := fn["parameters"].(string); p != `{"type":"object"}` {
 					t.Errorf("字符串参数被二次转义: %q", fn["parameters"])
@@ -468,7 +468,7 @@ func TestPrepareBodySerializesToolParameters(t *testing.T) {
 			},
 		},
 		"缺失参数补默认": {
-			tool:  `{"type":"function","function":{"name":"no_params","description":"d"}}`,
+			tool: `{"type":"function","function":{"name":"no_params","description":"d"}}`,
 			check: func(t *testing.T, fn map[string]any) {
 				if p, _ := fn["parameters"].(string); p != `{"type":"object","properties":{}}` {
 					t.Errorf("缺参应补默认字面量: %q", fn["parameters"])
@@ -476,7 +476,7 @@ func TestPrepareBodySerializesToolParameters(t *testing.T) {
 			},
 		},
 		"无名工具跳过": {
-			tool:  `{"type":"function","function":{"description":"没有名字"}}`,
+			tool: `{"type":"function","function":{"description":"没有名字"}}`,
 			check: func(t *testing.T, fn map[string]any) {
 				t.Fatalf("无名工具不应产出: %v", fn)
 			},
