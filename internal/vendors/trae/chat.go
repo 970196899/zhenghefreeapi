@@ -18,6 +18,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"sort"
 	"strings"
 	"time"
 
@@ -331,6 +332,13 @@ func PrepareBody(src []byte, cfg Config, resolved ResolvedModel) ([]byte, string
 	return data, resolved.ConfigName, err
 }
 
+// toolCallAcc 聚合单个工具调用的流式碎片（按 index 归并）。
+type toolCallAcc struct {
+	id   string
+	name string
+	args strings.Builder
+}
+
 // Chat 执行一次非流式对话（内部仍走上游 SSE，聚合后返回 OpenAI 结构）。
 func Chat(ctx context.Context, baseURL string, req ChatRequest) ([]byte, error) {
 	respBody, model, errDo := doTraeRequest(ctx, baseURL, req)
@@ -344,6 +352,7 @@ func Chat(ctx context.Context, baseURL string, req ChatRequest) ([]byte, error) 
 		reasoningSB strings.Builder
 		usage       map[string]any
 		finish      = "stop"
+		toolCalls   = map[int]*toolCallAcc{}
 	)
 
 	scanner := bufio.NewScanner(respBody)
@@ -377,6 +386,35 @@ func Chat(ctx context.Context, baseURL string, req ChatRequest) ([]byte, error) 
 			if rc, ok := payload["reasoning_content"].(string); ok {
 				reasoningSB.WriteString(rc)
 			}
+			// 按 index 聚合上游分片下发的工具调用：id/name 首见者胜，
+			// arguments 增量追加（上游可能拆多个 output 事件下发）。
+			if tcs, ok := payload["tool_calls"].([]any); ok {
+				for _, tc := range tcs {
+					tcMap, okMap := tc.(map[string]any)
+					if !okMap {
+						continue
+					}
+					idx := 0
+					if f, isNum := tcMap["index"].(float64); isNum {
+						idx = int(f)
+					}
+					acc := toolCalls[idx]
+					if acc == nil {
+						acc = &toolCallAcc{}
+						toolCalls[idx] = acc
+					}
+					if id, hasID := tcMap["id"].(string); hasID && id != "" && acc.id == "" {
+						acc.id = id
+					}
+					fc, _ := tcMap["function_call"].(map[string]any)
+					if name, hasName := fc["name"].(string); hasName && name != "" && acc.name == "" {
+						acc.name = name
+					}
+					if args, hasArgs := fc["arguments"].(string); hasArgs {
+						acc.args.WriteString(args)
+					}
+				}
+			}
 		case "token_usage":
 			usage = mapUsage(payload)
 		case "error":
@@ -394,6 +432,26 @@ func Chat(ctx context.Context, baseURL string, req ChatRequest) ([]byte, error) 
 		"role":              "assistant",
 		"content":           contentSB.String(),
 		"reasoning_content": reasoningSB.String(),
+	}
+	if len(toolCalls) > 0 {
+		indexes := make([]int, 0, len(toolCalls))
+		for idx := range toolCalls {
+			indexes = append(indexes, idx)
+		}
+		sort.Ints(indexes)
+		aggregated := make([]any, 0, len(toolCalls))
+		for _, idx := range indexes {
+			acc := toolCalls[idx]
+			aggregated = append(aggregated, map[string]any{
+				"id":   acc.id,
+				"type": "function",
+				"function": map[string]any{
+					"name":      acc.name,
+					"arguments": acc.args.String(),
+				},
+			})
+		}
+		message["tool_calls"] = aggregated
 	}
 	out := map[string]any{
 		"id":      "chatcmpl-" + core.RandomHex(6),
