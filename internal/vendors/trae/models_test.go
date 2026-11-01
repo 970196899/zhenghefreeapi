@@ -23,6 +23,9 @@ func TestConsumptionRateParsesVariants(t *testing.T) {
 		{"disabled at data", `{"consumption_rate":{"data":{"enable":false,"rate":0.9}}}`, ""},
 		{"missing", `{}`, ""},
 		{"null", ``, ""},
+		{"string wrapped", `"{\"consumption_rate\":{\"enable\":true,\"data\":{\"rate\":0.78}}}"`, "0.78"},
+		{"garbage string", `"hello"`, ""},
+		{"empty string", `""`, ""},
 	}
 	for _, tc := range cases {
 		if got := consumptionRate(json.RawMessage(tc.raw)); got != tc.want {
