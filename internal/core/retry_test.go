@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"strings"
 	"testing"
 
 	"freetier2api-plugin/cpasdk/pluginapi"
@@ -34,9 +35,9 @@ func TestQueryWithRetryReusesRefreshedCredential(t *testing.T) {
 		}
 	}
 	refreshCalls := 0
-	refresh := func() *Credential {
+	refresh := func() (*Credential, error) {
 		refreshCalls++
-		return newCredential
+		return newCredential, nil
 	}
 
 	if _, errQuota := QueryWithRetry(context.Background(), query, oldCredential, refresh); errQuota != nil {
@@ -67,9 +68,9 @@ func TestQueryWithRetryRetriesTransientWithoutRefresh(t *testing.T) {
 		return &pluginapi.QuotaFetchResponse{}, nil
 	}
 	refreshCalls := 0
-	refresh := func() *Credential {
+	refresh := func() (*Credential, error) {
 		refreshCalls++
-		return credential
+		return credential, nil
 	}
 
 	if _, errQuota := QueryWithRetry(context.Background(), query, credential, refresh); errQuota != nil {
@@ -91,7 +92,7 @@ func TestQueryWithRetryKeepsOriginalErrorWhenRefreshFails(t *testing.T) {
 		return nil, &Failure{Kind: FailureKindCredential, Status: http.StatusUnauthorized}
 	}
 	// 刷新失败（返回 nil）时不得用旧凭证再打一次。
-	if _, errQuota := QueryWithRetry(context.Background(), query, credential, func() *Credential { return nil }); errQuota == nil {
+	if _, errQuota := QueryWithRetry(context.Background(), query, credential, func() (*Credential, error) { return nil, nil }); errQuota == nil {
 		t.Fatal("刷新失败时应保留原错误")
 	}
 	if calls != 1 {
@@ -146,5 +147,37 @@ func TestIsTransientFailureOnlyTrustsClassification(t *testing.T) {
 		if got := IsTransientFailure(c.err); got != c.want {
 			t.Fatalf("%s: IsTransientFailure = %v, want %v", c.name, got, c.want)
 		}
+	}
+}
+
+// TestQueryWithRetryReportsRefreshFailure 锁定「自动续期失败」的呈现方式。
+//
+// 只报原始 401，用户看不出该重新登录还是稍后再试；而用旧凭证再打一次
+// 必然得到同一个 401，白白多打一次上游。正确行为是：不重试，把续期失败
+// 的原因并进原始错误，同时保留 401 的分类（宿主仍按凭证失效处置）。
+func TestQueryWithRetryReportsRefreshFailure(t *testing.T) {
+	credential := &Credential{Token: "old"}
+	calls := 0
+	query := func(*Credential) (*pluginapi.QuotaFetchResponse, error) {
+		calls++
+		return nil, &Failure{Kind: FailureKindCredential, Status: http.StatusUnauthorized}
+	}
+	refresh := func() (*Credential, error) {
+		return nil, errors.New("refresh_token 已失效，请重新登录 CodeArts")
+	}
+
+	_, errQuota := QueryWithRetry(context.Background(), query, credential, refresh)
+	if errQuota == nil {
+		t.Fatal("续期失败时应返回错误")
+	}
+	if calls != 1 {
+		t.Fatalf("查询次数 = %d, want 1（不得用旧凭证重试）", calls)
+	}
+	if !strings.Contains(errQuota.Error(), "自动续期失败") ||
+		!strings.Contains(errQuota.Error(), "请重新登录 CodeArts") {
+		t.Fatalf("错误未带上续期失败原因: %v", errQuota)
+	}
+	if !IsAuthExpired(errQuota) {
+		t.Fatalf("原始 401 的分类必须保留，宿主才能继续按凭证失效处置: %v", errQuota)
 	}
 }

@@ -96,7 +96,13 @@ func (s *Service) Checkin(ctx context.Context, vendor core.Vendor, credential *c
 	result, errCheckin := provider.Checkin(ctx, credential)
 	if errCheckin != nil && core.IsAuthExpired(errCheckin) {
 		if account := s.findAccount(ctx, "", uid); account != nil {
-			if refreshed, errRefresh := s.RefreshAccount(ctx, "", account); errRefresh == nil && refreshed {
+			refreshed, errRefresh := s.RefreshAccount(ctx, "", account)
+			switch {
+			case errRefresh != nil:
+				// 续期失败的原因要一并上抛：只报「凭证已过期」的话，用户
+				// 既看不出该重新登录还是稍后再试，也只能反复点签到。
+				errCheckin = core.AuthRetryError(errCheckin, errRefresh)
+			case refreshed:
 				credential = account.credential
 				result, errCheckin = provider.Checkin(ctx, credential)
 			}

@@ -15,9 +15,9 @@ func TestRunWithAuthRetryOnlyOn401(t *testing.T) {
 
 	refreshCalls := 0
 	actionCalls := 0
-	outcome, errAction := runWithAuthRetry(oldCredential, func() *core.Credential {
+	outcome, errAction := runWithAuthRetry(oldCredential, func() (*core.Credential, error) {
 		refreshCalls++
-		return newCredential
+		return newCredential, nil
 	}, func(credential *core.Credential) (accountActionOutcome, error) {
 		actionCalls++
 		if actionCalls == 1 {
@@ -37,9 +37,9 @@ func TestRunWithAuthRetryOnlyOn401(t *testing.T) {
 
 	// 非 401（参数错误）不刷新：刷新不会变好，只会多打一次上游。
 	refreshCalls = 0
-	_, _ = runWithAuthRetry(oldCredential, func() *core.Credential {
+	_, _ = runWithAuthRetry(oldCredential, func() (*core.Credential, error) {
 		refreshCalls++
-		return newCredential
+		return newCredential, nil
 	}, func(*core.Credential) (accountActionOutcome, error) {
 		return accountActionOutcome{}, &core.Failure{Kind: core.FailureKindBadParams, Status: http.StatusBadRequest}
 	})

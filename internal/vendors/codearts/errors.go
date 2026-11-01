@@ -22,6 +22,12 @@ const (
 	benefitMsgMarker  = "benefit not found"
 	// benefitHint 是给用户的可操作提示，附在上游原文之后而不是替换它。
 	benefitHint = "免费福利通道缺少有效权益；上游开放时可通过「一键签到」领取，签到无法恢复已关闭的通道。使用积分推理需明确开启 codearts_credit_enabled（会消耗账号积分）"
+	// refreshTokenInvalidHint 是 refresh_token 失效时的处置指引。
+	//
+	// 华为云 STS 的 refresh_token 是「单次使用 + 轮转」的：用一次就作废，
+	// 上游同时下发新的。这类失效（STS5.1804 / STS5.1806 / invalid_grant）
+	// 没有任何自动恢复手段，只能重新登录。
+	refreshTokenInvalidHint = "refresh_token 已失效（单次有效、用过即作废），请重新登录 CodeArts"
 )
 
 // errorEnvelope 是 CodeArts / InferHub 的业务错误信封。
@@ -142,6 +148,13 @@ func OpenAIErrorFrame(failure *core.Failure) ([]byte, error) {
 // 「这条请求/这个模型不可用」来判，不能照搬 HTTP 状态码规则。
 func classifyFailure(status int, code, msg string, payloadErr bool) *core.Failure {
 	switch {
+	case isRefreshTokenInvalid(code, msg):
+		// refresh_token 失效是**登录态**问题，不是请求参数问题：状态码是 400，
+		// 但按客户端错误归类会让控制台把「账号要重新登录」显示成「参数写错了」。
+		return &core.Failure{
+			Kind: core.FailureKindCredential, Status: status, Code: code,
+			Msg: msg + " — " + refreshTokenInvalidHint,
+		}
 	case isSecurityTokenExpired(code, msg):
 		// STS security token 过期是**可续期**的凭证问题：refresh_token 能换一套
 		// 新凭据。状态按 401 归一，宿主的保活重试才会先刷新再重查，而不是把
@@ -189,6 +202,31 @@ func isSecurityTokenExpired(code, msg string) bool {
 	lower := strings.ToLower(msg)
 	return strings.Contains(lower, "security token has expired") ||
 		strings.Contains(lower, "securitytoken has expired")
+}
+
+// isRefreshTokenInvalid 判断是否为「refresh_token 失效」。
+//
+// 上游对失效的 refresh_token 回 400 + STS5.1804（已过期）/ STS5.1806（已被
+// 使用），OAuth 形状的网关回 invalid_grant。这三种都只有重新登录能恢复。
+func isRefreshTokenInvalid(code, msg string) bool {
+	switch {
+	case strings.Contains(code, "STS5.1804"), strings.Contains(code, "STS5.1806"),
+		strings.Contains(code, "invalid_grant"):
+		return true
+	}
+	// 少数网关不下发业务码，只有正文。正文必须带判定词才算失效：
+	// 「refresh token is required」是参数错误，说成「要重新登录」会把用户
+	// 引去一个解决不了问题的方向。
+	lower := strings.ToLower(msg)
+	if !strings.Contains(lower, "refresh token") {
+		return false
+	}
+	for _, marker := range []string{"invalid", "expired", "has been used", "has expired", "revoked"} {
+		if strings.Contains(lower, marker) {
+			return true
+		}
+	}
+	return false
 }
 
 // isBenefitMissing 判断是否为「账号没有该模型的免费福利」。

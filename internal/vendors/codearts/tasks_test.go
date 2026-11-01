@@ -1,11 +1,15 @@
 package codearts
 
 import (
+	"context"
+	"encoding/json"
+	"fmt"
 	"net/http"
 	"strings"
 	"testing"
 
 	"freetier2api-plugin/internal/core"
+	"freetier2api-plugin/internal/hostbridge"
 )
 
 // TestIdentifierAcceptsNumberAndString 锁住 campaignId 的数字/字符串两种形态。
@@ -122,5 +126,44 @@ func TestMetricFloatAcceptsString(t *testing.T) {
 	}
 	if got := core.FloatFromAny(nil); got != 0 {
 		t.Fatalf("core.FloatFromAny(nil) = %v", got)
+	}
+}
+
+// TestFetchQuotaStopsOnAuthExpired 锁定额度查询遇到 401 的行为。
+//
+// 账户信息接口返回 401 说明凭证已失效：福利接口用的是同一把凭证，必然也回
+// 401，白打一次还会把两条错误链叠成「账户信息查询失败: 账户信息查询失败: …」。
+// 正确行为是原样返回 401（保活刷新后由上层重查），且错误前缀只出现一次。
+func TestFetchQuotaStopsOnAuthExpired(t *testing.T) {
+	calls := map[string]int{}
+	hostbridge.Configure(func(_ string, _ string, payload any) (json.RawMessage, error) {
+		raw, _ := json.Marshal(payload)
+		var req struct {
+			URL string `json:"url"`
+		}
+		_ = json.Unmarshal(raw, &req)
+		calls[req.URL]++
+		if req.URL == SnapEngineApiHost+EpPackageInfo {
+			return json.Marshal(map[string]any{
+				"StatusCode": 401,
+				"Body":       []byte(`{"error_code":"APIG.0602","error_msg":"Bad request: the security token has expired"}`),
+			})
+		}
+		return nil, fmt.Errorf("unexpected URL: %s", req.URL)
+	})
+	t.Cleanup(func() { hostbridge.Configure(nil) })
+
+	_, err := FetchQuota(context.Background(), &Credential{AccessKeyID: "ak", SecretAccessKey: "sk"})
+	if err == nil {
+		t.Fatal("凭证失效时应当报错")
+	}
+	if !core.IsAuthExpired(err) {
+		t.Fatalf("应当保持 401 语义以便保活重试: %v", err)
+	}
+	if strings.Count(err.Error(), "账户信息查询失败") != 1 {
+		t.Fatalf("错误前缀重复: %v", err)
+	}
+	if calls[BenefitHost+EpBenefitBalance] > 0 {
+		t.Fatal("凭证失效后不应再打福利额度接口")
 	}
 }

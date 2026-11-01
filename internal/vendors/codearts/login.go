@@ -25,6 +25,13 @@ import (
 	"freetier2api-plugin/internal/logger"
 )
 
+// defaultCredentialTTL 是解析不出上游过期时间时的兜底有效期。
+//
+// 上游 STS 临时凭据实际 TTL 约 2 小时，这里取 110 分钟留出余量。兜底值
+// 必须贴近真实 TTL：宿主据此判断凭证是否过期，填得过大（如 12 小时）会让
+// 已过期的凭证被当成「还活着」而跳过保活，直到真正用到才 401。
+const defaultCredentialTTL = 110 * time.Minute
+
 // pendingLogin 是一次进行中的 CodeArts 登录。
 type pendingLogin struct {
 	// TicketID 由本插件生成，授权链接与后续票据查询都用它。
@@ -150,7 +157,7 @@ func successResponse(creds *ticketCredentials, pending *pendingLogin) *pluginapi
 	uid := core.FirstNonEmpty(creds.UserID, creds.UserName, "codearts-user")
 	expiresAt := parseExpiration(creds.Expiration)
 	if expiresAt == 0 {
-		expiresAt = time.Now().Add(12 * time.Hour).Unix()
+		expiresAt = time.Now().Add(defaultCredentialTTL).Unix()
 	}
 	cred := &Credential{
 		Vendor:          VendorID,
@@ -546,7 +553,7 @@ func RefreshCredential(ctx context.Context, cred *Credential) (*Credential, bool
 		}
 	}
 	if updated.ExpiresAt == 0 {
-		updated.ExpiresAt = time.Now().Add(12 * time.Hour).Unix()
+		updated.ExpiresAt = time.Now().Add(defaultCredentialTTL).Unix()
 	}
 	return &updated, true, nil
 }

@@ -72,7 +72,7 @@ func TestRefreshedQuotaCredentialWithoutVendorKeepsCache(t *testing.T) {
 	application := &App{credentialCache: make(map[string]credentialCacheEntry)}
 	application.storeCredential("auth-1", &core.Credential{FileID: "auth-1", Token: "old"})
 
-	if credential := application.refreshedQuotaCredential(context.Background(), "cb", "auth-1", nil); credential != nil {
+	if credential, errRefresh := application.refreshedQuotaCredential(context.Background(), "cb", "auth-1", nil); errRefresh != nil || credential != nil {
 		t.Fatal("vendor 为 nil 时应返回 nil")
 	}
 	if cached, _ := application.cachedCredential("auth-1"); cached.Token != "old" {

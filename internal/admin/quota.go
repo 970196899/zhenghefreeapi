@@ -306,7 +306,7 @@ func (s *Service) queryQuota(ctx context.Context, job quotaJob) (*pluginapi.Quot
 			return quotaProvider.Quota(ctx, credential)
 		},
 		job.credential,
-		func() *core.Credential {
+		func() (*core.Credential, error) {
 			return s.refreshedCredential(ctx, "", job.entry, job.vendor)
 		},
 	)
@@ -315,12 +315,13 @@ func (s *Service) queryQuota(ctx context.Context, job quotaJob) (*pluginapi.Quot
 // refreshedCredential 在额度查询遇到 401 时保活刷新一次凭证。
 //
 // 与宿主额度路由（app.refreshedQuotaCredential）同源，实现见
-// accountpkg.RefreshCredential；刷新失败返回 nil，调用方保留原 401 如实上报。
-func (s *Service) refreshedCredential(ctx context.Context, callbackID string, entry core.HostAuth, vendor core.Vendor) *core.Credential {
+// accountpkg.RefreshCredential。续期失败时把原因一并返回：调用方要把它
+// 并进原始 401，用户才能知道该重新登录还是稍后再试。
+func (s *Service) refreshedCredential(ctx context.Context, callbackID string, entry core.HostAuth, vendor core.Vendor) (*core.Credential, error) {
 	if vendor == nil {
-		return nil
+		return nil, nil
 	}
 	authID := core.FirstNonEmpty(entry.ID, entry.Name)
 	return accountpkg.RefreshCredential(ctx, s.pool, callbackID, authID, vendor.ID(), s.deps.Config().EnabledRealms,
-		func() { s.tasks.Keepalive(ctx, callbackID, []string{authID}, 1) })
+		func() error { return s.tasks.KeepaliveError(ctx, callbackID, authID) })
 }

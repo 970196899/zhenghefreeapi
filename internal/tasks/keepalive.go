@@ -12,6 +12,7 @@ package tasks
 
 import (
 	"context"
+	"errors"
 	"sync"
 
 	"freetier2api-plugin/internal/auth"
@@ -134,6 +135,20 @@ func (s *Service) Keepalive(ctx context.Context, callbackID string, targets []st
 	return auth.RunBatch(jobs, concurrency, func(job *accountContext) KeepaliveResult {
 		return s.keepaliveOne(ctx, callbackID, job)
 	})
+}
+
+// KeepaliveError 续期单个账号并返回失败原因（成功返回 nil）。
+//
+// 额度查询遇到 401 时要把「为什么续不上」告诉用户：只报原始的
+// 「security token has expired」，用户看不出该重新登录还是稍后再试。
+// 复用 Keepalive 的批量实现，避免再写一份续期编排。
+func (s *Service) KeepaliveError(ctx context.Context, callbackID, authID string) error {
+	for _, result := range s.Keepalive(ctx, callbackID, []string{authID}, 1) {
+		if !result.OK {
+			return errors.New(result.Message)
+		}
+	}
+	return nil
 }
 
 // keepaliveOne 是单账号的续期与结果归一。

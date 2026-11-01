@@ -591,6 +591,11 @@ func FetchQuota(ctx context.Context, cred *Credential) (*pluginapi.QuotaFetchRes
 	}
 
 	info, errInfo := fetchAccountInfo(ctx, cred)
+	if errInfo != nil && core.IsAuthExpired(errInfo) {
+		// 凭证已失效：福利接口用的是同一把凭证，必然也回 401，白打一次
+		// 还会把两条错误链叠成一长串。原样返回，交给保活机制刷新后重查。
+		return nil, errInfo
+	}
 	if errInfo == nil && info.Package.IsCreditPackage {
 		if quota, okQuota := creditQuota(info); okQuota {
 			return quota, nil
@@ -603,7 +608,7 @@ func FetchQuota(ctx context.Context, cred *Credential) (*pluginapi.QuotaFetchRes
 	balance, errBalance := fetchBenefitBalance(ctx, cred)
 	if errBalance != nil {
 		if errInfo != nil {
-			return nil, fmt.Errorf("账户信息查询失败: %w", errInfo)
+			return nil, errInfo
 		}
 		return nil, errBalance
 	}

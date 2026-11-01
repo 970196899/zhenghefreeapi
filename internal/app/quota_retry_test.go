@@ -41,7 +41,7 @@ func TestQueryVendorQuotaRetriesWithRefreshedCredential(t *testing.T) {
 	}}
 	response, errQuery := queryVendorQuota(context.Background(),
 		&core.Credential{FileID: "old"}, provider,
-		func() *core.Credential { return &core.Credential{FileID: "new"} })
+		func() (*core.Credential, error) { return &core.Credential{FileID: "new"}, nil })
 	if errQuery != nil {
 		t.Fatalf("换凭证后应当成功，得到错误 %v", errQuery)
 	}
@@ -63,7 +63,7 @@ func TestQueryVendorQuotaKeeps401WhenRefreshFails(t *testing.T) {
 	}}
 	_, errQuery := queryVendorQuota(context.Background(),
 		&core.Credential{FileID: "old"}, provider,
-		func() *core.Credential { return nil })
+		func() (*core.Credential, error) { return nil, nil })
 	if errQuery == nil {
 		t.Fatal("刷新失败时应当把 401 抛出去")
 	}
@@ -84,9 +84,9 @@ func TestQueryVendorQuotaCallsOnceOnSuccess(t *testing.T) {
 	refreshed := 0
 	if _, errQuery := queryVendorQuota(context.Background(),
 		&core.Credential{FileID: "old"}, provider,
-		func() *core.Credential {
+		func() (*core.Credential, error) {
 			refreshed++
-			return &core.Credential{FileID: "new"}
+			return &core.Credential{FileID: "new"}, nil
 		}); errQuery != nil {
 		t.Fatalf("正常路径不应报错: %v", errQuery)
 	}
@@ -105,9 +105,9 @@ func TestQueryVendorQuotaDoesNotRefreshOn403(t *testing.T) {
 	refreshed := 0
 	_, errQuery := queryVendorQuota(context.Background(),
 		&core.Credential{FileID: "old"}, provider,
-		func() *core.Credential {
+		func() (*core.Credential, error) {
 			refreshed++
-			return &core.Credential{FileID: "new"}
+			return &core.Credential{FileID: "new"}, nil
 		})
 	if errQuery == nil {
 		t.Fatal("403 应当原样上抛")

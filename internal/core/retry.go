@@ -11,12 +11,20 @@ package core
 import (
 	"context"
 	"errors"
+	"fmt"
 	"net/http"
 	"time"
 )
 
 // QuotaRetryDelay 是瞬时故障重试前的等待。
 const QuotaRetryDelay = 500 * time.Millisecond
+
+// RefreshFunc 是一次凭证续期。
+//
+// 返回新凭证即视为续期成功；返回错误即续期失败，调用方要把失败原因并进
+// 原始错误——只报「凭证已过期」而不报「自动续期也没成功」，用户既看不出
+// 该重新登录还是稍后再试，也只能反复点刷新。
+type RefreshFunc func() (*Credential, error)
 
 // QueryWithRetry 执行一次上游查询并处理两种重试。
 //
@@ -30,7 +38,7 @@ func QueryWithRetry[T any](
 	ctx context.Context,
 	query func(*Credential) (T, error),
 	credential *Credential,
-	refresh func() *Credential,
+	refresh RefreshFunc,
 ) (T, error) {
 	result, used, errQuery := WithAuthRetry(credential, refresh, query)
 	if errQuery != nil && IsTransientFailure(errQuery) && SleepContext(ctx, QuotaRetryDelay) {
@@ -42,22 +50,40 @@ func QueryWithRetry[T any](
 // WithAuthRetry 在动作因凭证过期（401）失败时刷新一次凭证再重试。
 //
 // 返回最终结果、实际使用的凭证（重试时是刷新后的）与错误。刷新失败时保留原
-// 错误、不重试：用旧凭证再打一次只会得到同一个 401。
+// 错误、不重试：用旧凭证再打一次只会得到同一个 401；失败原因用
+// AuthRetryError 并进原始错误，让用户看到「续期也没成功」。
 func WithAuthRetry[T any](
 	credential *Credential,
-	refresh func() *Credential,
+	refresh RefreshFunc,
 	action func(*Credential) (T, error),
 ) (T, *Credential, error) {
 	result, errAction := action(credential)
 	if errAction == nil || !IsAuthExpired(errAction) || refresh == nil {
 		return result, credential, errAction
 	}
-	refreshed := refresh()
+	refreshed, errRefresh := refresh()
+	if errRefresh != nil {
+		return result, credential, AuthRetryError(errAction, errRefresh)
+	}
 	if refreshed == nil {
 		return result, credential, errAction
 	}
 	result, errAction = action(refreshed)
 	return result, refreshed, errAction
+}
+
+// AuthRetryError 把「凭证已过期」与「自动续期失败的原因」并成一条错误。
+//
+// 原始错误用 %w 保留：分类（IsAuthExpired / IsDefinitiveFailure）与宿主
+// 的状态码映射仍按凭证失效处理，续期原因只作为补充说明附在后面。
+func AuthRetryError(errAction, errRefresh error) error {
+	if errAction == nil {
+		return errRefresh
+	}
+	if errRefresh == nil {
+		return errAction
+	}
+	return fmt.Errorf("%w；自动续期失败：%v", errAction, errRefresh)
 }
 
 // IsTransientFailure 判断错误是否属于「稍后重试可能成功」的传输层故障。

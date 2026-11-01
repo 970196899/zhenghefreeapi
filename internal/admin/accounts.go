@@ -683,7 +683,7 @@ func (s *Service) runForAccounts(
 			VendorID: current.Vendor.ID(),
 			Realm:    current.Credential.RegionValue(),
 		}
-		outcome, errAction := runWithAuthRetry(current.Credential, func() *core.Credential {
+		outcome, errAction := runWithAuthRetry(current.Credential, func() (*core.Credential, error) {
 			return s.refreshedCredential(ctx, callbackID, current.Entry, current.Vendor)
 		}, func(credential *core.Credential) (accountActionOutcome, error) {
 			return action(ctx, current.Vendor, credential)
@@ -708,7 +708,7 @@ func (s *Service) runForAccounts(
 // 403 / 参数错误刷新不会变好。刷新与重试逻辑见 withAuthRetry。
 func runWithAuthRetry(
 	credential *core.Credential,
-	refresh func() *core.Credential,
+	refresh core.RefreshFunc,
 	action func(*core.Credential) (accountActionOutcome, error),
 ) (accountActionOutcome, error) {
 	outcome, _, errAction := core.WithAuthRetry(credential, refresh, action)

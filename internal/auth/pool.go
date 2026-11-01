@@ -159,26 +159,36 @@ func (p *Pool) CheckVendorLimit(ctx context.Context, callbackID string, vendor c
 // 再从账号池重新加载取到新凭证。两处各写一遍时，任一处忘了重新加载就会拿着
 // 旧凭证重试，401 原样再挂一次。
 //
-// 任一步拿不到就返回 nil，调用方保留原 401 错误如实上报——不要在 nil 上继续
-// 拼请求，也不要把「刷新失败」当成「额度为 0」。
-func RefreshCredential(ctx context.Context, pool *Pool, callbackID, authID, vendorID string, realms []string, keepalive func()) *core.Credential {
+// 返回值有两个含义，缺一不可：
+//   - 凭证非 nil：续期成功，调用方用它重试；
+//   - 错误非 nil：续期没成功，错误里是**原因**（例如「refresh_token 已被使用
+//     过，请重新登录」）。调用方要把它并进原始 401，否则用户只看到一句
+//     「凭证已过期」，既不知道该重新登录还是稍后再试，也只能反复点刷新。
+//
+// 两者都为 nil 表示「没能拿到新凭证但不致命」（如账号已不存在）：调用方
+// 保留原 401 如实上报——不要在 nil 上继续拼请求，也不要把「刷新失败」当成
+// 「额度为 0」。
+func RefreshCredential(ctx context.Context, pool *Pool, callbackID, authID, vendorID string, realms []string, keepalive func() error) (*core.Credential, error) {
 	if pool == nil || authID == "" || vendorID == "" {
-		return nil
+		return nil, nil
 	}
 	if keepalive != nil {
-		keepalive()
+		if errKeepalive := keepalive(); errKeepalive != nil {
+			return nil, errKeepalive
+		}
 	}
-	loaded, errLoad := pool.Load(ctx, callbackID, Options{Targets: []string{authID}, EnabledRealms: realms})
-	if errLoad != nil {
-		// 加载失败与「刷新后仍然找不到」表现相同（都返回 nil），不记一笔的话
+	// Load 的失败条目都对应本次的目标账号（Pool.Load 先按 Targets 过滤）。
+	loaded, failures := pool.Load(ctx, callbackID, Options{Targets: []string{authID}, EnabledRealms: realms})
+	if len(failures) > 0 {
+		// 加载失败与「刷新后仍然找不到」表现相同（都拿不到凭证），不记一笔的话
 		// 凭证服务真挂了，排查时只能看到「凭证缺失」（#71 第二轮复审 P2-6）。
-		logger.Debug("刷新后重新加载凭证失败 auth=%s vendor=%s: %v", authID, vendorID, errLoad)
-		return nil
+		logger.Debug("刷新后重新加载凭证失败 auth=%s vendor=%s: %s", authID, vendorID, failures[0].Message)
+		return nil, fmt.Errorf("刷新后重新加载凭证失败: %s", failures[0].Message)
 	}
 	for _, account := range loaded {
 		if account.Vendor != nil && account.Vendor.ID() == vendorID {
-			return account.Credential
+			return account.Credential, nil
 		}
 	}
-	return nil
+	return nil, nil
 }

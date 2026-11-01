@@ -423,7 +423,7 @@ func (a *App) handleQuotaFetch(request []byte) ([]byte, error) {
 	// 此前这里直接单发一次 provider.Quota()，于是 MiniMax（access token 只有
 	// 1 小时有效期）在宿主面板上会周期性挂 401，而同一时刻控制台刷新却是好的——
 	// 同一批上游、同一批凭证，两条路径的重试策略不该分裂。
-	response, errQuota := queryVendorQuota(ctx, credential, provider, func() *core.Credential {
+	response, errQuota := queryVendorQuota(ctx, credential, provider, func() (*core.Credential, error) {
 		return a.refreshedQuotaCredential(ctx, "", authID, vendor)
 	})
 	if errQuota != nil {
@@ -445,7 +445,7 @@ func (a *App) handleQuotaFetch(request []byte) ([]byte, error) {
 // 重试成功、刷新拿不到新凭证时保留 401、以及无错时只查一次。这三种结局决定
 // 宿主面板显示的是真额度还是错误（#71 第二轮复审 P2-5）。
 func queryVendorQuota(ctx context.Context, credential *core.Credential, provider core.QuotaProvider,
-	refresh func() *core.Credential) (*pluginapi.QuotaFetchResponse, error) {
+	refresh core.RefreshFunc) (*pluginapi.QuotaFetchResponse, error) {
 	return core.QueryWithRetry(ctx,
 		func(current *core.Credential) (*pluginapi.QuotaFetchResponse, error) {
 			return provider.Quota(ctx, current)
@@ -458,21 +458,24 @@ func queryVendorQuota(ctx context.Context, credential *core.Credential, provider
 // refreshedQuotaCredential 在额度查询遇到 401 时保活刷新一次凭证。
 //
 // 与控制台 admin.refreshedCredential 同源，实现见 auth.RefreshCredential。
-func (a *App) refreshedQuotaCredential(ctx context.Context, callbackID, authID string, vendor core.Vendor) *core.Credential {
+// 续期失败时把原因一并返回：调用方要把它并进原始 401，宿主面板才能显示
+// 「自动续期失败」而不是一句无从下手的「凭证已过期」。
+func (a *App) refreshedQuotaCredential(ctx context.Context, callbackID, authID string, vendor core.Vendor) (*core.Credential, error) {
 	if vendor == nil {
-		return nil
+		return nil, nil
 	}
-	credential := auth.RefreshCredential(ctx, a.pool, callbackID, authID, vendor.ID(), a.Config().EnabledRealms,
-		func() {
-			if a.tasks != nil {
-				a.tasks.Keepalive(ctx, callbackID, []string{authID}, 1)
+	credential, errRefresh := auth.RefreshCredential(ctx, a.pool, callbackID, authID, vendor.ID(), a.Config().EnabledRealms,
+		func() error {
+			if a.tasks == nil {
+				return nil
 			}
+			return a.tasks.KeepaliveError(ctx, callbackID, authID)
 		})
-	if credential == nil {
-		return nil
+	if errRefresh != nil || credential == nil {
+		return nil, errRefresh
 	}
 	a.adoptRefreshedCredential(authID, credential)
-	return credential
+	return credential, nil
 }
 
 // adoptRefreshedCredential 把刷新后的凭证回写回源缓存。

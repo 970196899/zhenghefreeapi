@@ -120,3 +120,34 @@ func TestClassifySnapErrors(t *testing.T) {
 		t.Fatalf("STS 过期应归为 401 凭证错误: kind=%v status=%d", expired.Kind, expired.HTTPStatus())
 	}
 }
+
+// TestClassifyRefreshTokenInvalid 锁住 refresh_token 失效的分类。
+//
+// 华为云 STS 的 refresh_token 是「单次使用 + 轮转」的：用一次就作废。
+// 上游对这种失效回 HTTP 400 + STS5.1806（已被使用）/ STS5.1804（已过期），
+// OAuth 形状的网关回 invalid_grant。三者都只有重新登录能恢复——若按 400
+// 归成客户端错误，用户会看到「参数写错了」，直到额度一直刷不出来才发现
+// 真相。分类为凭据错误并明确提示重新登录。
+func TestClassifyRefreshTokenInvalid(t *testing.T) {
+	cases := []struct {
+		name   string
+		status int
+		body   string
+	}{
+		{"refresh_token 已被使用", http.StatusBadRequest,
+			`{"error_code":"STS5.1806","error_msg":"invalid refresh token: 'the refresh token has been used'"}`},
+		{"refresh_token 已过期", http.StatusBadRequest,
+			`{"error_code":"STS5.1804","error_msg":"the refresh token has expired"}`},
+		{"invalid_grant", http.StatusBadRequest,
+			`{"error":"invalid_grant","error_description":"refresh token expired"}`},
+	}
+	for _, c := range cases {
+		failure := Classify(c.status, c.body)
+		if failure.Kind != core.FailureKindCredential {
+			t.Fatalf("%s: kind = %s, want credential", c.name, failure.Kind)
+		}
+		if !strings.Contains(failure.Msg, "请重新登录 CodeArts") {
+			t.Fatalf("%s: 缺少重新登录提示: %s", c.name, failure.Msg)
+		}
+	}
+}
