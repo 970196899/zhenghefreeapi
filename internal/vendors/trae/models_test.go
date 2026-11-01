@@ -2,6 +2,7 @@ package trae
 
 import (
 	"encoding/json"
+	"slices"
 	"testing"
 )
 
@@ -127,5 +128,60 @@ func TestSelectWireModelPrefersMaxOverDev(t *testing.T) {
 	}
 	if model.MaxTokens != 64000 {
 		t.Fatalf("MaxTokens = %d, want 64000", model.MaxTokens)
+	}
+}
+
+// TestCatalogEntriesMapsEffortsToStandard 锁定出站档位宣告契约：
+// 原生 light/high/extra_high 三档对外统一宣告为标准五档
+// ["low","medium","high","xhigh","max"]，默认档按 nativeEffortToStandard 映射；
+// 无档位配置的条目必须保持 Efforts=nil（宿主按 len>0 判空渲染）。
+func TestCatalogEntriesMapsEffortsToStandard(t *testing.T) {
+	const body = `{"config_info_list":[
+	 {"config_name":"glm-5.2","config_switch":true,"usage":"chat_completion",
+	  "display_config":{"display_name":"GLM-5.2","model_capability":"reasoning_model"},
+	  "reasoning_effort_config":{"default_level":"extra_high","options":["light","high","extra_high"]},
+	  "model_detail_list":[{"model_name":"glm-5.2__dev","max_tokens":32000}]},
+	 {"config_name":"plain","config_switch":true,"usage":"chat_completion",
+	  "display_config":{"display_name":"Plain"},
+	  "model_detail_list":[{"model_name":"plain__dev","max_tokens":8192}]},
+	 {"config_name":"empty-opts","config_switch":true,"usage":"chat_completion",
+	  "display_config":{"display_name":"Empty"},
+	  "reasoning_effort_config":{"default_level":"light","options":[]},
+	  "model_detail_list":[{"model_name":"empty__dev","max_tokens":4096}]},
+	 {"config_name":"odd","config_switch":true,"usage":"chat_completion",
+	  "display_config":{"display_name":"Odd"},
+	  "reasoning_effort_config":{"default_level":"ultra","options":["light"]},
+	  "model_detail_list":[{"model_name":"odd__dev","max_tokens":4096}]}]}`
+
+	var parsed catalogResponse
+	if err := json.Unmarshal([]byte(body), &parsed); err != nil {
+		t.Fatalf("解析响应失败: %v", err)
+	}
+	_, metadata := catalogEntries(parsed.ConfigInfoList)
+
+	glm := metadata["glm-5.2"]
+	if !slices.Equal(glm.Efforts, []string{"low", "medium", "high", "xhigh", "max"}) {
+		t.Fatalf("Efforts = %v, want [low medium high xhigh max]", glm.Efforts)
+	}
+	if glm.DefaultEffort != "xhigh" {
+		t.Fatalf("DefaultEffort = %q, want xhigh（extra_high 映射）", glm.DefaultEffort)
+	}
+
+	plain := metadata["plain"]
+	if plain.Efforts != nil || plain.DefaultEffort != "" {
+		t.Fatalf("无档位配置的条目被污染: Efforts=%v DefaultEffort=%q", plain.Efforts, plain.DefaultEffort)
+	}
+
+	empty := metadata["empty-opts"]
+	if empty.Efforts != nil {
+		t.Fatalf("Options 为空时不应宣告档位: %v", empty.Efforts)
+	}
+
+	odd := metadata["odd"]
+	if odd.DefaultEffort != "high" {
+		t.Fatalf("未知默认档 %q 应回落 high, got %q", "ultra", odd.DefaultEffort)
+	}
+	if !slices.Equal(odd.Efforts, []string{"low", "medium", "high", "xhigh", "max"}) {
+		t.Fatalf("odd 条目 Efforts = %v, want 标准五档", odd.Efforts)
 	}
 }
