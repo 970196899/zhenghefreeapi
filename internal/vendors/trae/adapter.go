@@ -172,6 +172,9 @@ func (v *adapter) modelsToPluginAPI(models []Model) []pluginapi.ModelInfo {
 			Description:        model.Description,
 			ContextLength:      int64(model.ContextWindow),
 			MaxOutputTokens:    int64(model.MaxTokens),
+			Efforts:            model.Efforts,
+			DefaultEffort:      model.DefaultEffort,
+			SupportsImages:     model.SupportsImages,
 			SupportsTools:      model.SupportsTools,
 			CanDisableThinking: !model.IsReasoning,
 		}, true
