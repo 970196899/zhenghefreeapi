@@ -1302,3 +1302,49 @@ func TestJWTIdentityExtractsAccountID(t *testing.T) {
 		t.Errorf("非 JWT 应返回空，得到 %q", got)
 	}
 }
+
+// TestPrepareBodyTranslatesReasoningEffort 锁定入站档位翻译契约：
+// 客户端标准档（low/medium/high/xhigh/max）与 OpenAI 风格 minimal 都要翻译成
+// Trae 原生档（light/high/extra_high）；原生档直通；空/非法一律回落默认 high。
+// 上游对档位有要求，缺失时部分模型拒绝（见 cline prepareBody 先例）。
+func TestPrepareBodyTranslatesReasoningEffort(t *testing.T) {
+	cfg := ConfigFor(RegionCN)
+	resolved := ResolvedModel{ConfigName: "glm-5.2", WireName: "glm-5.2__dev"}
+
+	cases := []struct {
+		name string
+		src  string
+		want string
+	}{
+		{"low映射light", `{"reasoning_effort":"low"}`, "light"},
+		{"minimal映射light", `{"reasoning_effort":"minimal"}`, "light"},
+		{"medium映射high", `{"reasoning_effort":"medium"}`, "high"},
+		{"high直通", `{"reasoning_effort":"high"}`, "high"},
+		{"xhigh映射extra_high", `{"reasoning_effort":"xhigh"}`, "extra_high"},
+		{"max映射extra_high", `{"reasoning_effort":"max"}`, "extra_high"},
+		{"原生light直通", `{"reasoning_effort":"light"}`, "light"},
+		{"原生extra_high直通", `{"reasoning_effort":"extra_high"}`, "extra_high"},
+		{"大写混合归一", `{"reasoning_effort":"XHigh"}`, "extra_high"},
+		{"空串回落默认", `{"reasoning_effort":""}`, "high"},
+		{"缺键回落默认", `{}`, "high"},
+		{"非法值回落默认", `{"reasoning_effort":"turbo"}`, "high"},
+		{"非法类型回落默认", `{"reasoning_effort":3}`, "high"},
+		{"camelCase兜底键被删除", `{"reasoningEffort":"xhigh"}`, "extra_high"},
+	}
+	for _, tc := range cases {
+		body, _, errPrep := PrepareBody([]byte(tc.src), cfg, resolved)
+		if errPrep != nil {
+			t.Fatalf("%s: PrepareBody: %v", tc.name, errPrep)
+		}
+		var got map[string]any
+		if errJSON := json.Unmarshal(body, &got); errJSON != nil {
+			t.Fatalf("%s: decode body: %v", tc.name, errJSON)
+		}
+		if got["reasoning_effort"] != tc.want {
+			t.Errorf("%s: reasoning_effort = %v, want %q", tc.name, got["reasoning_effort"], tc.want)
+		}
+		if _, okCamel := got["reasoningEffort"]; okCamel {
+			t.Errorf("%s: camelCase reasoningEffort 键必须被删除", tc.name)
+		}
+	}
+}
