@@ -18,6 +18,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"sort"
 	"strings"
 	"time"
 
@@ -266,32 +267,47 @@ func PrepareBody(src []byte, cfg Config, resolved ResolvedModel) ([]byte, string
 	delete(obj, "model")
 	delete(obj, "function")
 
-	// 归一化 tools 数组：OpenAI 风格的 [{type: "function", function: {...}}] 转为 Trae 扁平格式 [{name: "...", parameters: {...}}]
+	// 归一化 tools 数组为 Trae 上游契约：保持嵌套结构
+	// {type: "function", function: {name, description, parameters: <JSON字符串>}}。
+	// 上游 Go 后端把 parameters 按 string 反序列化（2026-11-01 抓包实证）：
+	// 传 JSON 对象会被判无工具签名或直接 400；缺失时补默认空对象字符串。
 	if rawTools, ok := obj["tools"].([]any); ok && len(rawTools) > 0 {
 		normalized := make([]any, 0, len(rawTools))
 		for _, item := range rawTools {
 			toolMap, isMap := item.(map[string]any)
-			if !isMap {
+			if !isMap || len(toolMap) == 0 {
 				continue
 			}
-			// 如果包含嵌套的 function 对象，将其属性提升到顶层并丢弃 type 包装
-			if fnObj, hasFn := toolMap["function"].(map[string]any); hasFn && fnObj != nil {
-				flatTool := make(map[string]any, len(fnObj)+len(toolMap))
-				// 复制其他可能存在的辅助字段（如 strict 等）
-				for k, v := range toolMap {
-					if k != "type" && k != "function" {
-						flatTool[k] = v
-					}
-				}
-				// 覆盖 function 内部的核心字段（name, description, parameters）
-				for k, v := range fnObj {
-					flatTool[k] = v
-				}
-				normalized = append(normalized, flatTool)
-			} else {
-				// 已经为扁平格式，直接保留
-				normalized = append(normalized, toolMap)
+			fnObj, hasFn := toolMap["function"].(map[string]any)
+			if !hasFn || fnObj == nil {
+				fnObj = toolMap // 兼容扁平输入
 			}
+			name, _ := fnObj["name"].(string)
+			if strings.TrimSpace(name) == "" {
+				continue
+			}
+			description, _ := fnObj["description"].(string)
+
+			var paramsStr string
+			if p, hasP := fnObj["parameters"]; hasP && p != nil {
+				if s, isStr := p.(string); isStr {
+					paramsStr = s // 已是字符串，原样透传
+				} else if raw, errMarshal := json.Marshal(p); errMarshal == nil {
+					paramsStr = string(raw)
+				}
+			}
+			if paramsStr == "" {
+				paramsStr = `{"type":"object","properties":{}}`
+			}
+
+			normalized = append(normalized, map[string]any{
+				"type": "function",
+				"function": map[string]any{
+					"name":        name,
+					"description": description,
+					"parameters":  paramsStr,
+				},
+			})
 		}
 		obj["tools"] = normalized
 	}
@@ -316,6 +332,13 @@ func PrepareBody(src []byte, cfg Config, resolved ResolvedModel) ([]byte, string
 	return data, resolved.ConfigName, err
 }
 
+// toolCallAcc 聚合单个工具调用的流式碎片（按 index 归并）。
+type toolCallAcc struct {
+	id   string
+	name string
+	args strings.Builder
+}
+
 // Chat 执行一次非流式对话（内部仍走上游 SSE，聚合后返回 OpenAI 结构）。
 func Chat(ctx context.Context, baseURL string, req ChatRequest) ([]byte, error) {
 	respBody, model, errDo := doTraeRequest(ctx, baseURL, req)
@@ -329,6 +352,7 @@ func Chat(ctx context.Context, baseURL string, req ChatRequest) ([]byte, error) 
 		reasoningSB strings.Builder
 		usage       map[string]any
 		finish      = "stop"
+		toolCalls   = map[int]*toolCallAcc{}
 	)
 
 	scanner := bufio.NewScanner(respBody)
@@ -362,6 +386,35 @@ func Chat(ctx context.Context, baseURL string, req ChatRequest) ([]byte, error) 
 			if rc, ok := payload["reasoning_content"].(string); ok {
 				reasoningSB.WriteString(rc)
 			}
+			// 按 index 聚合上游分片下发的工具调用：id/name 首见者胜，
+			// arguments 增量追加（上游可能拆多个 output 事件下发）。
+			if tcs, ok := payload["tool_calls"].([]any); ok {
+				for _, tc := range tcs {
+					tcMap, okMap := tc.(map[string]any)
+					if !okMap {
+						continue
+					}
+					idx := 0
+					if f, isNum := tcMap["index"].(float64); isNum {
+						idx = int(f)
+					}
+					acc := toolCalls[idx]
+					if acc == nil {
+						acc = &toolCallAcc{}
+						toolCalls[idx] = acc
+					}
+					if id, hasID := tcMap["id"].(string); hasID && id != "" && acc.id == "" {
+						acc.id = id
+					}
+					fc, _ := tcMap["function_call"].(map[string]any)
+					if name, hasName := fc["name"].(string); hasName && name != "" && acc.name == "" {
+						acc.name = name
+					}
+					if args, hasArgs := fc["arguments"].(string); hasArgs {
+						acc.args.WriteString(args)
+					}
+				}
+			}
 		case "token_usage":
 			usage = mapUsage(payload)
 		case "error":
@@ -379,6 +432,26 @@ func Chat(ctx context.Context, baseURL string, req ChatRequest) ([]byte, error) 
 		"role":              "assistant",
 		"content":           contentSB.String(),
 		"reasoning_content": reasoningSB.String(),
+	}
+	if len(toolCalls) > 0 {
+		indexes := make([]int, 0, len(toolCalls))
+		for idx := range toolCalls {
+			indexes = append(indexes, idx)
+		}
+		sort.Ints(indexes)
+		aggregated := make([]any, 0, len(toolCalls))
+		for _, idx := range indexes {
+			acc := toolCalls[idx]
+			aggregated = append(aggregated, map[string]any{
+				"id":   acc.id,
+				"type": "function",
+				"function": map[string]any{
+					"name":      acc.name,
+					"arguments": acc.args.String(),
+				},
+			})
+		}
+		message["tool_calls"] = aggregated
 	}
 	out := map[string]any{
 		"id":      "chatcmpl-" + core.RandomHex(6),
@@ -468,6 +541,35 @@ func ChatStream(ctx context.Context, baseURL string, req ChatRequest, onChunk St
 			if reasoning != "" {
 				delta["reasoning_content"] = reasoning
 			}
+			// 下行工具调用分发：上游 function_call 增量块映射为 OpenAI delta
+			// function 形态；无 id 的增量块不伪造 id 键（finish_reason 由 done 透传）。
+			if tcs, ok := payload["tool_calls"].([]any); ok && len(tcs) > 0 {
+				openAIToolCalls := make([]any, 0, len(tcs))
+				for _, tc := range tcs {
+					tcMap, okMap := tc.(map[string]any)
+					if !okMap {
+						continue
+					}
+					fc, _ := tcMap["function_call"].(map[string]any)
+					fnName, _ := fc["name"].(string)
+					fnArgs, _ := fc["arguments"].(string)
+					callItem := map[string]any{
+						"index": tcMap["index"],
+						"type":  "function",
+						"function": map[string]any{
+							"name":      fnName,
+							"arguments": fnArgs,
+						},
+					}
+					if id, hasID := tcMap["id"].(string); hasID && id != "" {
+						callItem["id"] = id
+					}
+					openAIToolCalls = append(openAIToolCalls, callItem)
+				}
+				if len(openAIToolCalls) > 0 {
+					delta["tool_calls"] = openAIToolCalls
+				}
+			}
 			if len(delta) > 0 {
 				if errEmit := emit(delta, nil); errEmit != nil {
 					return errEmit
@@ -495,7 +597,11 @@ func ChatStream(ctx context.Context, baseURL string, req ChatRequest, onChunk St
 			msg, _ := payload["message"].(string)
 			return fmt.Errorf("trae stream error: code=%.0f msg=%s", code, msg)
 		case "done":
-			return emit(map[string]any{}, "stop")
+			finish := "stop"
+			if fr, ok := payload["finish_reason"].(string); ok && fr != "" {
+				finish = fr
+			}
+			return emit(map[string]any{}, finish)
 		}
 	}
 

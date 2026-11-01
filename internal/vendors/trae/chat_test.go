@@ -158,6 +158,40 @@ data: {"finish_reason":"stop"}
 
 `
 
+// chatToolCallSSEFixture：上游触发工具调用的真实事件形态（2026-11-01 抓包样例 + 无 id 增量块）。
+const chatToolCallSSEFixture = `id: 1
+event: output
+data: {"response":"","reasoning_content":"","tool_calls":[{"index":0,"id":"call_x1","type":"function","function_call":{"name":"Bash","arguments":"{\"command\":\"ls\"}"}}]}
+
+id: 2
+event: output
+data: {"tool_calls":[{"index":0,"function_call":{"arguments":" -la"}}]}
+
+id: 3
+event: done
+data: {"finish_reason":"tool_calls"}
+
+`
+
+// chatToolAggSSEFixture：非流式聚合用——index 1 先到、index 0 拆两段 arguments。
+const chatToolAggSSEFixture = `id: 1
+event: output
+data: {"response":"","tool_calls":[{"index":1,"id":"call_b","type":"function","function_call":{"name":"Read","arguments":"{\"path\":\"a.go\"}"}}]}
+
+id: 2
+event: output
+data: {"tool_calls":[{"index":0,"id":"call_a","type":"function","function_call":{"name":"Bash","arguments":"{\"command\":"}}]}
+
+id: 3
+event: output
+data: {"tool_calls":[{"index":0,"function_call":{"arguments":"\"ls -la\"}"}}]}
+
+id: 4
+event: done
+data: {"finish_reason":"tool_calls"}
+
+`
+
 const catalogFixture = `{
   "allow_tenant_user_add_model": true,
   "config_info_list": [
@@ -285,9 +319,10 @@ func TestPrepareBodyBuildsTraeCodeEnvelope(t *testing.T) {
 	}
 }
 
-// TestPrepareBodyNormalizesOpenAITools 锁定 tools 扁平化：
-// OpenAI 嵌套格式 [{type:"function", function:{...}}] 必须转为 Trae 扁平格式，
-// 否则 llm_raw_chat 网关直接 400（见 2026-11-01 spec）。
+// TestPrepareBodyNormalizesOpenAITools 锁定上行 tools 契约：
+// OpenAI 嵌套格式 [{type:"function", function:{...}}] 必须保持嵌套结构，
+// 且 function.parameters 必须序列化为 JSON 字符串（Trae Go 后端按 string 反序列化，
+// 传对象会被判无工具或直接 400，见 2026-11-01 bidirectional spec）。
 func TestPrepareBodyNormalizesOpenAITools(t *testing.T) {
 	cfg := ConfigFor(RegionCN)
 	resolved := ResolvedModel{ConfigName: "glm-5.2", WireName: "glm-5.2__dev"}
@@ -308,18 +343,26 @@ func TestPrepareBodyNormalizesOpenAITools(t *testing.T) {
 		t.Fatalf("tools 应为长度 1 的数组: %v", got["tools"])
 	}
 	tool, _ := tools[0].(map[string]any)
-	if _, hasType := tool["type"]; hasType {
-		t.Error("扁平格式不应保留外层 type 字段")
+	if tool["type"] != "function" {
+		t.Errorf("外层 type 应为 function: %v", tool)
 	}
-	if _, hasFn := tool["function"]; hasFn {
-		t.Error("扁平格式不应保留 function 嵌套")
+	fn, okFn := tool["function"].(map[string]any)
+	if !okFn {
+		t.Fatalf("function 嵌套缺失: %v", tool)
 	}
-	if tool["name"] != "get_weather" || tool["description"] != "查天气" {
-		t.Errorf("function 内字段未提升到根层级: %v", tool)
+	if fn["name"] != "get_weather" || fn["description"] != "查天气" {
+		t.Errorf("function 字段未正确挂载: %v", fn)
 	}
-	params, okParams := tool["parameters"].(map[string]any)
-	if !okParams || params["type"] != "object" {
-		t.Errorf("parameters 未提升到根层级: %v", tool["parameters"])
+	params, okParams := fn["parameters"].(string)
+	if !okParams {
+		t.Fatalf("parameters 应为字符串, got %T", fn["parameters"])
+	}
+	var back map[string]any
+	if errBack := json.Unmarshal([]byte(params), &back); errBack != nil {
+		t.Fatalf("parameters 不是合法 JSON: %v (%s)", errBack, params)
+	}
+	if back["type"] != "object" {
+		t.Errorf("parameters 回读 type = %v", back["type"])
 	}
 	// content 块包装不受归一化影响。
 	msgs, _ := got["messages"].([]any)
@@ -329,8 +372,8 @@ func TestPrepareBodyNormalizesOpenAITools(t *testing.T) {
 	}
 }
 
-// 已是扁平格式的 tools 必须原样保留（幂等，向后兼容 Trae 官方客户端直发）。
-func TestPrepareBodyKeepsFlatTools(t *testing.T) {
+// 扁平输入必须重包装为嵌套+字符串化（幂等向上兼容）。
+func TestPrepareBodyConvertsFlatToolsToNested(t *testing.T) {
 	cfg := ConfigFor(RegionCN)
 	resolved := ResolvedModel{ConfigName: "glm-5.2", WireName: "glm-5.2__dev"}
 	src := []byte(`{"model":"glm-5.2","messages":[{"role":"user","content":"hi"}],"tools":[
@@ -350,8 +393,15 @@ func TestPrepareBodyKeepsFlatTools(t *testing.T) {
 		t.Fatalf("tools 长度 = %d, want 1", len(tools))
 	}
 	tool, _ := tools[0].(map[string]any)
-	if tool["name"] != "get_weather" || tool["description"] != "查天气" {
-		t.Errorf("扁平 tools 被改写: %v", tool)
+	if tool["type"] != "function" {
+		t.Errorf("扁平输入应转嵌套: %v", tool)
+	}
+	fn, _ := tool["function"].(map[string]any)
+	if fn["name"] != "get_weather" || fn["description"] != "查天气" {
+		t.Errorf("扁平字段未正确提升: %v", fn)
+	}
+	if p, ok := fn["parameters"].(string); !ok || p != `{"type":"object"}` {
+		t.Errorf("扁平对象参数应序列化为字符串: %v", fn["parameters"])
 	}
 }
 
@@ -378,6 +428,84 @@ func TestPrepareBodyLeavesMissingOrEmptyTools(t *testing.T) {
 				t.Errorf("%s: tools 不应被改写: %v", name, v)
 			}
 		}
+	}
+}
+
+// TestPrepareBodySerializesToolParameters 锁定核心契约：
+// parameters 恒为合法 JSON 字符串——对象自动序列化、字符串原样透传、缺失补默认。
+func TestPrepareBodySerializesToolParameters(t *testing.T) {
+	cfg := ConfigFor(RegionCN)
+	resolved := ResolvedModel{ConfigName: "glm-5.2", WireName: "glm-5.2__dev"}
+
+	cases := map[string]struct {
+		tool  string
+		check func(t *testing.T, fn map[string]any)
+	}{
+		"对象参数序列化": {
+			tool: `{"type":"function","function":{"name":"get_weather","description":"查天气","parameters":{"type":"object","properties":{"city":{"type":"string"}}}}}`,
+			check: func(t *testing.T, fn map[string]any) {
+				p, ok := fn["parameters"].(string)
+				if !ok {
+					t.Fatalf("parameters 应为字符串, got %T", fn["parameters"])
+				}
+				var back map[string]any
+				if err := json.Unmarshal([]byte(p), &back); err != nil {
+					t.Fatalf("参数字符串非法: %v", err)
+				}
+				props, _ := back["properties"].(map[string]any)
+				city, _ := props["city"].(map[string]any)
+				if back["type"] != "object" || city["type"] != "string" {
+					t.Errorf("序列化丢失结构: %s", p)
+				}
+			},
+		},
+		"字符串参数透传": {
+			tool: `{"type":"function","function":{"name":"get_weather","description":"查天气","parameters":"{\"type\":\"object\"}"}}`,
+			check: func(t *testing.T, fn map[string]any) {
+				if p, _ := fn["parameters"].(string); p != `{"type":"object"}` {
+					t.Errorf("字符串参数被二次转义: %q", fn["parameters"])
+				}
+			},
+		},
+		"缺失参数补默认": {
+			tool: `{"type":"function","function":{"name":"no_params","description":"d"}}`,
+			check: func(t *testing.T, fn map[string]any) {
+				if p, _ := fn["parameters"].(string); p != `{"type":"object","properties":{}}` {
+					t.Errorf("缺参应补默认字面量: %q", fn["parameters"])
+				}
+			},
+		},
+		"无名工具跳过": {
+			tool: `{"type":"function","function":{"description":"没有名字"}}`,
+			check: func(t *testing.T, fn map[string]any) {
+				t.Fatalf("无名工具不应产出: %v", fn)
+			},
+		},
+	}
+
+	for name, tc := range cases {
+		src := []byte(`{"model":"glm-5.2","messages":[{"role":"user","content":"hi"}],"tools":[` + tc.tool + `]}`)
+		body, _, errPrep := PrepareBody(src, cfg, resolved)
+		if errPrep != nil {
+			t.Fatalf("%s: PrepareBody: %v", name, errPrep)
+		}
+		var got map[string]any
+		if errJSON := json.Unmarshal(body, &got); errJSON != nil {
+			t.Fatalf("%s: decode body: %v", name, errJSON)
+		}
+		toolList, _ := got["tools"].([]any)
+		if name == "无名工具跳过" {
+			if len(toolList) != 0 {
+				t.Errorf("%s: tools 应为空, got %v", name, got["tools"])
+			}
+			continue
+		}
+		if len(toolList) != 1 {
+			t.Fatalf("%s: tools 长度 = %d, want 1", name, len(toolList))
+		}
+		tool, _ := toolList[0].(map[string]any)
+		fn, _ := tool["function"].(map[string]any)
+		tc.check(t, fn)
 	}
 }
 
@@ -526,6 +654,152 @@ func TestChatStreamEmitsOpenAIChunks(t *testing.T) {
 	}
 	if !strings.Contains(joined, `"finish_reason":"stop"`) {
 		t.Error("缺少终止 chunk")
+	}
+}
+
+// TestChatStreamEmitsToolCalls 锁定流式下行：function_call 映射为 OpenAI delta function 形态，
+// 无 id 的增量块原样透传，done 事件的 finish_reason=tool_calls 正确闭环。
+func TestChatStreamEmitsToolCalls(t *testing.T) {
+	stubHost(t)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case EpModels:
+			_, _ = w.Write([]byte(catalogFixture))
+		case EpChat:
+			w.Header().Set("Content-Type", "text/event-stream")
+			_, _ = w.Write([]byte(chatToolCallSSEFixture))
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer server.Close()
+	cfg := testConfig(t, server.URL)
+
+	var chunks []map[string]any
+	errStream := ChatStream(context.Background(), "", ChatRequest{
+		Credential: testCredential(),
+		Profile:    cfg,
+		Body:       []byte(`{"model":"glm-5.2","messages":[{"role":"user","content":"hi"}]}`),
+	}, func(chunk []byte) error {
+		var m map[string]any
+		if err := json.Unmarshal(chunk, &m); err != nil {
+			t.Fatalf("chunk 非法: %v", err)
+		}
+		chunks = append(chunks, m)
+		return nil
+	})
+	if errStream != nil {
+		t.Fatalf("ChatStream: %v", errStream)
+	}
+
+	var firstCall, secondCall map[string]any
+	var finishAny any
+	for _, m := range chunks {
+		choices, _ := m["choices"].([]any)
+		if len(choices) == 0 {
+			continue
+		}
+		choice, _ := choices[0].(map[string]any)
+		delta, _ := choice["delta"].(map[string]any)
+		if delta == nil {
+			continue
+		}
+		if _, has := delta["function_call"]; has {
+			t.Errorf("delta 不得残留上游 function_call 命名: %v", delta)
+		}
+		if tcs, ok := delta["tool_calls"].([]any); ok && len(tcs) > 0 {
+			call, _ := tcs[0].(map[string]any)
+			if _, hasID := call["id"]; hasID {
+				if firstCall == nil {
+					firstCall = call
+				} else if secondCall == nil {
+					secondCall = call
+				}
+			} else if secondCall == nil && firstCall != nil {
+				secondCall = call
+			}
+		}
+		if fr := choice["finish_reason"]; fr != nil {
+			finishAny = fr
+		}
+	}
+	if firstCall == nil || secondCall == nil {
+		t.Fatalf("应收到两个 tool_calls delta, first=%v second=%v", firstCall, secondCall)
+	}
+	if firstCall["id"] != "call_x1" || firstCall["type"] != "function" || firstCall["index"] != float64(0) {
+		t.Errorf("首个调用元数据错误: %v", firstCall)
+	}
+	fn1, _ := firstCall["function"].(map[string]any)
+	if fn1["name"] != "Bash" || fn1["arguments"] != `{"command":"ls"}` {
+		t.Errorf("首个调用 function 错误: %v", fn1)
+	}
+	if _, hasID := secondCall["id"]; hasID {
+		t.Errorf("无 id 的增量块不应伪造 id 键: %v", secondCall)
+	}
+	fn2, _ := secondCall["function"].(map[string]any)
+	if fn2["name"] != "" || fn2["arguments"] != " -la" {
+		t.Errorf("增量块 function 错误: %v", fn2)
+	}
+	if finishAny != "tool_calls" {
+		t.Errorf("finish_reason = %v, want tool_calls", finishAny)
+	}
+}
+
+// TestChatAggregatesToolCallsIntoMessage 锁定非流式聚合：
+// 按 index 合并 id/name/增量 arguments，输出升序、不带 index 键、finish_reason 透传。
+func TestChatAggregatesToolCallsIntoMessage(t *testing.T) {
+	stubHost(t)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case EpModels:
+			_, _ = w.Write([]byte(catalogFixture))
+		case EpChat:
+			w.Header().Set("Content-Type", "text/event-stream")
+			_, _ = w.Write([]byte(chatToolAggSSEFixture))
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer server.Close()
+	cfg := testConfig(t, server.URL)
+
+	body, errChat := Chat(context.Background(), "", ChatRequest{
+		Credential: testCredential(),
+		Profile:    cfg,
+		Body:       []byte(`{"model":"glm-5.2","messages":[{"role":"user","content":"hi"}]}`),
+	})
+	if errChat != nil {
+		t.Fatalf("Chat: %v", errChat)
+	}
+	var got map[string]any
+	if errJSON := json.Unmarshal(body, &got); errJSON != nil {
+		t.Fatalf("decode response: %v", errJSON)
+	}
+	choices, _ := got["choices"].([]any)
+	choice, _ := choices[0].(map[string]any)
+	if choice["finish_reason"] != "tool_calls" {
+		t.Errorf("finish_reason = %v, want tool_calls", choice["finish_reason"])
+	}
+	message, _ := choice["message"].(map[string]any)
+	calls, okCalls := message["tool_calls"].([]any)
+	if !okCalls || len(calls) != 2 {
+		t.Fatalf("message.tool_calls = %v, want 长度 2", message["tool_calls"])
+	}
+	first, _ := calls[0].(map[string]any)
+	if _, has := first["index"]; has {
+		t.Errorf("非流式 tool_calls 项不应带 index 键: %v", first)
+	}
+	if first["id"] != "call_a" || first["type"] != "function" {
+		t.Errorf("index 0 聚合错误: %v", first)
+	}
+	fn0, _ := first["function"].(map[string]any)
+	if fn0["name"] != "Bash" || fn0["arguments"] != `{"command":"ls -la"}` {
+		t.Errorf("index 0 arguments 未增量拼接: %v", fn0)
+	}
+	second, _ := calls[1].(map[string]any)
+	fn1, _ := second["function"].(map[string]any)
+	if second["id"] != "call_b" || fn1["name"] != "Read" || fn1["arguments"] != `{"path":"a.go"}` {
+		t.Errorf("index 1 聚合错误: %v (function=%v)", second, fn1)
 	}
 }
 
