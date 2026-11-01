@@ -267,6 +267,10 @@ func PrepareBody(src []byte, cfg Config, resolved ResolvedModel) ([]byte, string
 	delete(obj, "model")
 	delete(obj, "function")
 
+	// 档位翻译：客户端标准档 → Trae 原生档，恒写入（缺键/空/非法回落默认 high）。
+	obj["reasoning_effort"] = effortToNative(strings.ToLower(strings.TrimSpace(effortRaw(obj))))
+	delete(obj, "reasoningEffort")
+
 	// 归一化 tools 数组为 Trae 上游契约：保持嵌套结构
 	// {type: "function", function: {name, description, parameters: <JSON字符串>}}。
 	// 上游 Go 后端把 parameters 按 string 反序列化（2026-11-01 抓包实证）：
@@ -330,6 +334,34 @@ func PrepareBody(src []byte, cfg Config, resolved ResolvedModel) ([]byte, string
 
 	data, err := json.Marshal(obj)
 	return data, resolved.ConfigName, err
+}
+
+// effortToNative 把客户端档位翻译成 Trae 上游原生档（light/high/extra_high）。
+// 任何无法识别的输入（空串、未知值、类型断言失败产生的空值）一律回落默认 high，
+// 本函数永不失败——上游收到非法档位直接 400，宁可回落也不要透传脏值。
+func effortToNative(raw string) string {
+	switch raw {
+	case "low", "minimal", "light":
+		return "light"
+	case "medium", "high":
+		return "high"
+	case "xhigh", "max", "extra_high":
+		return "extra_high"
+	default:
+		return "high"
+	}
+}
+
+// effortRaw 读取客户端档位原文：snake_case 优先、camelCase 兜底；
+// 非字符串类型（数字/对象等）视为缺失，交由 effortToNative 回落默认档。
+func effortRaw(obj map[string]any) string {
+	if v, ok := obj["reasoning_effort"].(string); ok {
+		return v
+	}
+	if v, ok := obj["reasoningEffort"].(string); ok {
+		return v
+	}
+	return ""
 }
 
 // toolCallAcc 聚合单个工具调用的流式碎片（按 index 归并）。
