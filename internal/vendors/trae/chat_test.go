@@ -158,6 +158,40 @@ data: {"finish_reason":"stop"}
 
 `
 
+// chatToolCallSSEFixture：上游触发工具调用的真实事件形态（2026-11-01 抓包样例 + 无 id 增量块）。
+const chatToolCallSSEFixture = `id: 1
+event: output
+data: {"response":"","reasoning_content":"","tool_calls":[{"index":0,"id":"call_x1","type":"function","function_call":{"name":"Bash","arguments":"{\"command\":\"ls\"}"}}]}
+
+id: 2
+event: output
+data: {"tool_calls":[{"index":0,"function_call":{"arguments":" -la"}}]}
+
+id: 3
+event: done
+data: {"finish_reason":"tool_calls"}
+
+`
+
+// chatToolAggSSEFixture：非流式聚合用——index 1 先到、index 0 拆两段 arguments。
+const chatToolAggSSEFixture = `id: 1
+event: output
+data: {"response":"","tool_calls":[{"index":1,"id":"call_b","type":"function","function_call":{"name":"Read","arguments":"{\"path\":\"a.go\"}"}}]}
+
+id: 2
+event: output
+data: {"tool_calls":[{"index":0,"id":"call_a","type":"function","function_call":{"name":"Bash","arguments":"{\"command\":"}}]}
+
+id: 3
+event: output
+data: {"tool_calls":[{"index":0,"function_call":{"arguments":"\"ls -la\"}"}}]}
+
+id: 4
+event: done
+data: {"finish_reason":"tool_calls"}
+
+`
+
 const catalogFixture = `{
   "allow_tenant_user_add_model": true,
   "config_info_list": [
@@ -620,6 +654,152 @@ func TestChatStreamEmitsOpenAIChunks(t *testing.T) {
 	}
 	if !strings.Contains(joined, `"finish_reason":"stop"`) {
 		t.Error("缺少终止 chunk")
+	}
+}
+
+// TestChatStreamEmitsToolCalls 锁定流式下行：function_call 映射为 OpenAI delta function 形态，
+// 无 id 的增量块原样透传，done 事件的 finish_reason=tool_calls 正确闭环。
+func TestChatStreamEmitsToolCalls(t *testing.T) {
+	stubHost(t)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case EpModels:
+			_, _ = w.Write([]byte(catalogFixture))
+		case EpChat:
+			w.Header().Set("Content-Type", "text/event-stream")
+			_, _ = w.Write([]byte(chatToolCallSSEFixture))
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer server.Close()
+	cfg := testConfig(t, server.URL)
+
+	var chunks []map[string]any
+	errStream := ChatStream(context.Background(), "", ChatRequest{
+		Credential: testCredential(),
+		Profile:    cfg,
+		Body:       []byte(`{"model":"glm-5.2","messages":[{"role":"user","content":"hi"}]}`),
+	}, func(chunk []byte) error {
+		var m map[string]any
+		if err := json.Unmarshal(chunk, &m); err != nil {
+			t.Fatalf("chunk 非法: %v", err)
+		}
+		chunks = append(chunks, m)
+		return nil
+	})
+	if errStream != nil {
+		t.Fatalf("ChatStream: %v", errStream)
+	}
+
+	var firstCall, secondCall map[string]any
+	var finishAny any
+	for _, m := range chunks {
+		choices, _ := m["choices"].([]any)
+		if len(choices) == 0 {
+			continue
+		}
+		choice, _ := choices[0].(map[string]any)
+		delta, _ := choice["delta"].(map[string]any)
+		if delta == nil {
+			continue
+		}
+		if _, has := delta["function_call"]; has {
+			t.Errorf("delta 不得残留上游 function_call 命名: %v", delta)
+		}
+		if tcs, ok := delta["tool_calls"].([]any); ok && len(tcs) > 0 {
+			call, _ := tcs[0].(map[string]any)
+			if _, hasID := call["id"]; hasID {
+				if firstCall == nil {
+					firstCall = call
+				} else if secondCall == nil {
+					secondCall = call
+				}
+			} else if secondCall == nil && firstCall != nil {
+				secondCall = call
+			}
+		}
+		if fr := choice["finish_reason"]; fr != nil {
+			finishAny = fr
+		}
+	}
+	if firstCall == nil || secondCall == nil {
+		t.Fatalf("应收到两个 tool_calls delta, first=%v second=%v", firstCall, secondCall)
+	}
+	if firstCall["id"] != "call_x1" || firstCall["type"] != "function" || firstCall["index"] != float64(0) {
+		t.Errorf("首个调用元数据错误: %v", firstCall)
+	}
+	fn1, _ := firstCall["function"].(map[string]any)
+	if fn1["name"] != "Bash" || fn1["arguments"] != `{"command":"ls"}` {
+		t.Errorf("首个调用 function 错误: %v", fn1)
+	}
+	if _, hasID := secondCall["id"]; hasID {
+		t.Errorf("无 id 的增量块不应伪造 id 键: %v", secondCall)
+	}
+	fn2, _ := secondCall["function"].(map[string]any)
+	if fn2["name"] != "" || fn2["arguments"] != " -la" {
+		t.Errorf("增量块 function 错误: %v", fn2)
+	}
+	if finishAny != "tool_calls" {
+		t.Errorf("finish_reason = %v, want tool_calls", finishAny)
+	}
+}
+
+// TestChatAggregatesToolCallsIntoMessage 锁定非流式聚合：
+// 按 index 合并 id/name/增量 arguments，输出升序、不带 index 键、finish_reason 透传。
+func TestChatAggregatesToolCallsIntoMessage(t *testing.T) {
+	stubHost(t)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case EpModels:
+			_, _ = w.Write([]byte(catalogFixture))
+		case EpChat:
+			w.Header().Set("Content-Type", "text/event-stream")
+			_, _ = w.Write([]byte(chatToolAggSSEFixture))
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer server.Close()
+	cfg := testConfig(t, server.URL)
+
+	body, errChat := Chat(context.Background(), "", ChatRequest{
+		Credential: testCredential(),
+		Profile:    cfg,
+		Body:       []byte(`{"model":"glm-5.2","messages":[{"role":"user","content":"hi"}]}`),
+	})
+	if errChat != nil {
+		t.Fatalf("Chat: %v", errChat)
+	}
+	var got map[string]any
+	if errJSON := json.Unmarshal(body, &got); errJSON != nil {
+		t.Fatalf("decode response: %v", errJSON)
+	}
+	choices, _ := got["choices"].([]any)
+	choice, _ := choices[0].(map[string]any)
+	if choice["finish_reason"] != "tool_calls" {
+		t.Errorf("finish_reason = %v, want tool_calls", choice["finish_reason"])
+	}
+	message, _ := choice["message"].(map[string]any)
+	calls, okCalls := message["tool_calls"].([]any)
+	if !okCalls || len(calls) != 2 {
+		t.Fatalf("message.tool_calls = %v, want 长度 2", message["tool_calls"])
+	}
+	first, _ := calls[0].(map[string]any)
+	if _, has := first["index"]; has {
+		t.Errorf("非流式 tool_calls 项不应带 index 键: %v", first)
+	}
+	if first["id"] != "call_a" || first["type"] != "function" {
+		t.Errorf("index 0 聚合错误: %v", first)
+	}
+	fn0, _ := first["function"].(map[string]any)
+	if fn0["name"] != "Bash" || fn0["arguments"] != `{"command":"ls -la"}` {
+		t.Errorf("index 0 arguments 未增量拼接: %v", fn0)
+	}
+	second, _ := calls[1].(map[string]any)
+	fn1, _ := second["function"].(map[string]any)
+	if second["id"] != "call_b" || fn1["name"] != "Read" || fn1["arguments"] != `{"path":"a.go"}` {
+		t.Errorf("index 1 聚合错误: %v (function=%v)", second, fn1)
 	}
 }
 

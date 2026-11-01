@@ -483,6 +483,35 @@ func ChatStream(ctx context.Context, baseURL string, req ChatRequest, onChunk St
 			if reasoning != "" {
 				delta["reasoning_content"] = reasoning
 			}
+			// 下行工具调用分发：上游 function_call 增量块映射为 OpenAI delta
+			// function 形态；无 id 的增量块不伪造 id 键（finish_reason 由 done 透传）。
+			if tcs, ok := payload["tool_calls"].([]any); ok && len(tcs) > 0 {
+				openAIToolCalls := make([]any, 0, len(tcs))
+				for _, tc := range tcs {
+					tcMap, okMap := tc.(map[string]any)
+					if !okMap {
+						continue
+					}
+					fc, _ := tcMap["function_call"].(map[string]any)
+					fnName, _ := fc["name"].(string)
+					fnArgs, _ := fc["arguments"].(string)
+					callItem := map[string]any{
+						"index": tcMap["index"],
+						"type":  "function",
+						"function": map[string]any{
+							"name":      fnName,
+							"arguments": fnArgs,
+						},
+					}
+					if id, hasID := tcMap["id"].(string); hasID && id != "" {
+						callItem["id"] = id
+					}
+					openAIToolCalls = append(openAIToolCalls, callItem)
+				}
+				if len(openAIToolCalls) > 0 {
+					delta["tool_calls"] = openAIToolCalls
+				}
+			}
 			if len(delta) > 0 {
 				if errEmit := emit(delta, nil); errEmit != nil {
 					return errEmit
@@ -510,7 +539,11 @@ func ChatStream(ctx context.Context, baseURL string, req ChatRequest, onChunk St
 			msg, _ := payload["message"].(string)
 			return fmt.Errorf("trae stream error: code=%.0f msg=%s", code, msg)
 		case "done":
-			return emit(map[string]any{}, "stop")
+			finish := "stop"
+			if fr, ok := payload["finish_reason"].(string); ok && fr != "" {
+				finish = fr
+			}
+			return emit(map[string]any{}, finish)
 		}
 	}
 
