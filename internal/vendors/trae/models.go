@@ -35,6 +35,14 @@ type Model struct {
 	MaxTokens     int    `json:"max_tokens"`
 	SupportsTools bool   `json:"supports_tools"`
 	IsReasoning   bool   `json:"is_reasoning"`
+	// SupportsImages 来自上游 display_config.multimodal：支持图片输入的模型
+	// 在控制台能力列显示「图片」标签。
+	SupportsImages bool `json:"supports_images"`
+	// Efforts 是上游 reasoning_effort_config.options 的推理档位（如
+	// light/high/extra_high），控制台推理档位列直接展示。
+	Efforts []string `json:"efforts,omitempty"`
+	// DefaultEffort 是上游 reasoning_effort_config.default_level 的默认档。
+	DefaultEffort string `json:"default_effort,omitempty"`
 	// Credits 是上游 consumption_rate 的计费倍率（原样文案，如 "0.94"）。
 	//
 	// empty 表示上游没有倍率（enable=false 或缺字段），控制台显示「—」。
@@ -124,15 +132,24 @@ func catalogEntries(items []catalogItem) (map[string]ResolvedModel, map[string]M
 			}
 		}
 		models[strings.ToLower(name)] = ResolvedModel{ConfigName: name, WireName: wire}
+		var efforts []string
+		var defaultEffort string
+		if item.ReasoningEffortConfig != nil {
+			efforts = item.ReasoningEffortConfig.Options
+			defaultEffort = item.ReasoningEffortConfig.DefaultLevel
+		}
 		metadata[name] = Model{
 			ID:            name,
 			Name:          display,
 			Description:   "Trae 上游模型",
 			ContextWindow: contextWindow,
 			MaxTokens:     maxTokens,
-			SupportsTools: strings.Contains(item.ExtraConfig, `"native_function_call":true`),
-			IsReasoning:   item.DisplayConfig.ModelCapability == "reasoning_model",
-			Credits:       consumptionRate(item.DisplayContactConfig),
+			SupportsTools:  strings.Contains(item.ExtraConfig, `"native_function_call":true`),
+			IsReasoning:    item.DisplayConfig.ModelCapability == "reasoning_model",
+			SupportsImages: item.DisplayConfig.Multimodal,
+			Efforts:        efforts,
+			DefaultEffort:  defaultEffort,
+			Credits:        consumptionRate(item.DisplayContactConfig),
 		}
 	}
 	return models, metadata
@@ -193,7 +210,13 @@ type catalogItem struct {
 	DisplayConfig struct {
 		DisplayName     string `json:"display_name"`
 		ModelCapability string `json:"model_capability"`
+		Multimodal      bool   `json:"multimodal"`
 	} `json:"display_config"`
+	// ReasoningEffortConfig 是推理档位配置；指针区分「上游未下发」与零值。
+	ReasoningEffortConfig *struct {
+		DefaultLevel string   `json:"default_level"`
+		Options      []string `json:"options"`
+	} `json:"reasoning_effort_config"`
 	ExtraConfig     string          `json:"extra_config"`
 	ModelDetailList []catalogDetail `json:"model_detail_list"`
 	// DisplayContactConfig 里带计费倍率，但字段大小写在两代响应里不一致
