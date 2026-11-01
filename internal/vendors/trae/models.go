@@ -28,17 +28,17 @@ import (
 )
 
 type Model struct {
-	ID            string `json:"id"`
-	Name          string `json:"name"`
-	Description   string `json:"description"`
-	ContextWindow int    `json:"context_window"`
-	MaxTokens     int    `json:"max_tokens"`
-	SupportsTools bool   `json:"supports_tools"`
-	IsReasoning   bool   `json:"is_reasoning"`
-	// Credits 是上游 consumption_rate 的计费倍率（原样文案，如 "0.94"）。
-	//
-	// empty 表示上游没有倍率（enable=false 或缺字段），控制台显示「—」。
-	Credits string `json:"credits,omitempty"`
+	ID              string `json:"id"`
+	Name            string `json:"name"`
+	Description     string `json:"description"`
+	ContextWindow   int    `json:"context_window"`
+	MaxTokens       int    `json:"max_tokens"`
+	SupportsTools   bool   `json:"supports_tools"`
+	IsReasoning     bool   `json:"is_reasoning"`
+	SupportsImages  bool   `json:"supports_images"`
+	Efforts         []string `json:"efforts,omitempty"`
+	DefaultEffort   string `json:"default_effort,omitempty"`
+	Credits         string `json:"credits,omitempty"`
 }
 
 // ResolvedModel 是一次对话请求使用的模型标识对。
@@ -124,15 +124,24 @@ func catalogEntries(items []catalogItem) (map[string]ResolvedModel, map[string]M
 			}
 		}
 		models[strings.ToLower(name)] = ResolvedModel{ConfigName: name, WireName: wire}
+		var efforts []string
+		var defaultEffort string
+		if item.ReasoningEffortConfig != nil {
+			efforts = item.ReasoningEffortConfig.Options
+			defaultEffort = item.ReasoningEffortConfig.DefaultLevel
+		}
 		metadata[name] = Model{
 			ID:            name,
 			Name:          display,
 			Description:   "Trae 上游模型",
 			ContextWindow: contextWindow,
 			MaxTokens:     maxTokens,
-			SupportsTools: strings.Contains(item.ExtraConfig, `"native_function_call":true`),
-			IsReasoning:   item.DisplayConfig.ModelCapability == "reasoning_model",
-			Credits:       consumptionRate(item.DisplayContactConfig),
+			SupportsTools:  strings.Contains(item.ExtraConfig, `"native_function_call":true`),
+			IsReasoning:    item.DisplayConfig.ModelCapability == "reasoning_model",
+			SupportsImages: item.DisplayConfig.Multimodal,
+			Efforts:        efforts,
+			DefaultEffort:  defaultEffort,
+			Credits:        consumptionRate(item.DisplayContactConfig),
 		}
 	}
 	return models, metadata
@@ -193,7 +202,13 @@ type catalogItem struct {
 	DisplayConfig struct {
 		DisplayName     string `json:"display_name"`
 		ModelCapability string `json:"model_capability"`
+		Multimodal      bool   `json:"multimodal"`
 	} `json:"display_config"`
+	// ReasoningEffortConfig 是推理档位配置；指针区分「上游未下发」与零值。
+	ReasoningEffortConfig *struct {
+		DefaultLevel string   `json:"default_level"`
+		Options      []string `json:"options"`
+	} `json:"reasoning_effort_config"`
 	ExtraConfig     string          `json:"extra_config"`
 	ModelDetailList []catalogDetail `json:"model_detail_list"`
 	// DisplayContactConfig 里带计费倍率，但字段大小写在两代响应里不一致
@@ -386,9 +401,18 @@ func consumptionRate(raw json.RawMessage) string {
 }
 
 // decodeObject 把 JSON 解成键值对表；空值/非对象返回 false。
+//
+// 上游有时把整个对象下发成带引号转义的 JSON 字符串，首字节是引号时
+// 先解一层再当对象解；解不出合法对象时走原路失败。
 func decodeObject(raw json.RawMessage) (map[string]json.RawMessage, bool) {
 	if len(raw) == 0 || string(raw) == "null" {
 		return nil, false
+	}
+	if trimmed := strings.TrimSpace(string(raw)); strings.HasPrefix(trimmed, `"`) {
+		var unquoted string
+		if errUnquote := json.Unmarshal(raw, &unquoted); errUnquote == nil {
+			raw = json.RawMessage(unquoted)
+		}
 	}
 	var doc map[string]json.RawMessage
 	if errDoc := json.Unmarshal(raw, &doc); errDoc != nil || doc == nil {

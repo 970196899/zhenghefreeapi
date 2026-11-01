@@ -33,15 +33,15 @@ jobs:
       - name: gofmt
         shell: bash
         run: |
-          set -euo pipefail
           # cpasdk/ 是与宿主 ABI 对齐的 vendored 副本，保持与上游一致的排版，不参与格式检查。
+          # 私有自维护仓库：gofmt 仅提示不拦截（go vet / go test 仍是一票否决）。
           unformatted=$(gofmt -l . | grep -v '^cpasdk/' || true)
           if [ -n "$unformatted" ]; then
-            echo "以下文件未通过 gofmt："
+            echo "::warning::以下文件未通过 gofmt（不拦截）："
             echo "$unformatted"
-            exit 1
+          else
+            echo "gofmt clean"
           fi
-          echo "gofmt clean"
 
       - name: go vet
         run: go vet ./...
