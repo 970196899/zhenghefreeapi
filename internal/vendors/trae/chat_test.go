@@ -285,9 +285,10 @@ func TestPrepareBodyBuildsTraeCodeEnvelope(t *testing.T) {
 	}
 }
 
-// TestPrepareBodyNormalizesOpenAITools 锁定 tools 扁平化：
-// OpenAI 嵌套格式 [{type:"function", function:{...}}] 必须转为 Trae 扁平格式，
-// 否则 llm_raw_chat 网关直接 400（见 2026-11-01 spec）。
+// TestPrepareBodyNormalizesOpenAITools 锁定上行 tools 契约：
+// OpenAI 嵌套格式 [{type:"function", function:{...}}] 必须保持嵌套结构，
+// 且 function.parameters 必须序列化为 JSON 字符串（Trae Go 后端按 string 反序列化，
+// 传对象会被判无工具或直接 400，见 2026-11-01 bidirectional spec）。
 func TestPrepareBodyNormalizesOpenAITools(t *testing.T) {
 	cfg := ConfigFor(RegionCN)
 	resolved := ResolvedModel{ConfigName: "glm-5.2", WireName: "glm-5.2__dev"}
@@ -308,18 +309,26 @@ func TestPrepareBodyNormalizesOpenAITools(t *testing.T) {
 		t.Fatalf("tools 应为长度 1 的数组: %v", got["tools"])
 	}
 	tool, _ := tools[0].(map[string]any)
-	if _, hasType := tool["type"]; hasType {
-		t.Error("扁平格式不应保留外层 type 字段")
+	if tool["type"] != "function" {
+		t.Errorf("外层 type 应为 function: %v", tool)
 	}
-	if _, hasFn := tool["function"]; hasFn {
-		t.Error("扁平格式不应保留 function 嵌套")
+	fn, okFn := tool["function"].(map[string]any)
+	if !okFn {
+		t.Fatalf("function 嵌套缺失: %v", tool)
 	}
-	if tool["name"] != "get_weather" || tool["description"] != "查天气" {
-		t.Errorf("function 内字段未提升到根层级: %v", tool)
+	if fn["name"] != "get_weather" || fn["description"] != "查天气" {
+		t.Errorf("function 字段未正确挂载: %v", fn)
 	}
-	params, okParams := tool["parameters"].(map[string]any)
-	if !okParams || params["type"] != "object" {
-		t.Errorf("parameters 未提升到根层级: %v", tool["parameters"])
+	params, okParams := fn["parameters"].(string)
+	if !okParams {
+		t.Fatalf("parameters 应为字符串, got %T", fn["parameters"])
+	}
+	var back map[string]any
+	if errBack := json.Unmarshal([]byte(params), &back); errBack != nil {
+		t.Fatalf("parameters 不是合法 JSON: %v (%s)", errBack, params)
+	}
+	if back["type"] != "object" {
+		t.Errorf("parameters 回读 type = %v", back["type"])
 	}
 	// content 块包装不受归一化影响。
 	msgs, _ := got["messages"].([]any)
@@ -329,8 +338,8 @@ func TestPrepareBodyNormalizesOpenAITools(t *testing.T) {
 	}
 }
 
-// 已是扁平格式的 tools 必须原样保留（幂等，向后兼容 Trae 官方客户端直发）。
-func TestPrepareBodyKeepsFlatTools(t *testing.T) {
+// 扁平输入必须重包装为嵌套+字符串化（幂等向上兼容）。
+func TestPrepareBodyConvertsFlatToolsToNested(t *testing.T) {
 	cfg := ConfigFor(RegionCN)
 	resolved := ResolvedModel{ConfigName: "glm-5.2", WireName: "glm-5.2__dev"}
 	src := []byte(`{"model":"glm-5.2","messages":[{"role":"user","content":"hi"}],"tools":[
@@ -350,8 +359,15 @@ func TestPrepareBodyKeepsFlatTools(t *testing.T) {
 		t.Fatalf("tools 长度 = %d, want 1", len(tools))
 	}
 	tool, _ := tools[0].(map[string]any)
-	if tool["name"] != "get_weather" || tool["description"] != "查天气" {
-		t.Errorf("扁平 tools 被改写: %v", tool)
+	if tool["type"] != "function" {
+		t.Errorf("扁平输入应转嵌套: %v", tool)
+	}
+	fn, _ := tool["function"].(map[string]any)
+	if fn["name"] != "get_weather" || fn["description"] != "查天气" {
+		t.Errorf("扁平字段未正确提升: %v", fn)
+	}
+	if p, ok := fn["parameters"].(string); !ok || p != `{"type":"object"}` {
+		t.Errorf("扁平对象参数应序列化为字符串: %v", fn["parameters"])
 	}
 }
 
@@ -378,6 +394,84 @@ func TestPrepareBodyLeavesMissingOrEmptyTools(t *testing.T) {
 				t.Errorf("%s: tools 不应被改写: %v", name, v)
 			}
 		}
+	}
+}
+
+// TestPrepareBodySerializesToolParameters 锁定核心契约：
+// parameters 恒为合法 JSON 字符串——对象自动序列化、字符串原样透传、缺失补默认。
+func TestPrepareBodySerializesToolParameters(t *testing.T) {
+	cfg := ConfigFor(RegionCN)
+	resolved := ResolvedModel{ConfigName: "glm-5.2", WireName: "glm-5.2__dev"}
+
+	cases := map[string]struct {
+		tool  string
+		check func(t *testing.T, fn map[string]any)
+	}{
+		"对象参数序列化": {
+			tool: `{"type":"function","function":{"name":"get_weather","description":"查天气","parameters":{"type":"object","properties":{"city":{"type":"string"}}}}}`,
+			check: func(t *testing.T, fn map[string]any) {
+				p, ok := fn["parameters"].(string)
+				if !ok {
+					t.Fatalf("parameters 应为字符串, got %T", fn["parameters"])
+				}
+				var back map[string]any
+				if err := json.Unmarshal([]byte(p), &back); err != nil {
+					t.Fatalf("参数字符串非法: %v", err)
+				}
+				props, _ := back["properties"].(map[string]any)
+				city, _ := props["city"].(map[string]any)
+				if back["type"] != "object" || city["type"] != "string" {
+					t.Errorf("序列化丢失结构: %s", p)
+				}
+			},
+		},
+		"字符串参数透传": {
+			tool:  `{"type":"function","function":{"name":"get_weather","description":"查天气","parameters":"{\"type\":\"object\"}"}}`,
+			check: func(t *testing.T, fn map[string]any) {
+				if p, _ := fn["parameters"].(string); p != `{"type":"object"}` {
+					t.Errorf("字符串参数被二次转义: %q", fn["parameters"])
+				}
+			},
+		},
+		"缺失参数补默认": {
+			tool: `{"type":"function","function":{"name":"no_params","description":"d"}}`,
+			check: func(t *testing.T, fn map[string]any) {
+				if p, _ := fn["parameters"].(string); p != `{"type":"object","properties":{}}` {
+					t.Errorf("缺参应补默认字面量: %q", fn["parameters"])
+				}
+			},
+		},
+		"无名工具跳过": {
+			tool: `{"type":"function","function":{"description":"没有名字"}}`,
+			check: func(t *testing.T, fn map[string]any) {
+				t.Fatalf("无名工具不应产出: %v", fn)
+			},
+		},
+	}
+
+	for name, tc := range cases {
+		src := []byte(`{"model":"glm-5.2","messages":[{"role":"user","content":"hi"}],"tools":[` + tc.tool + `]}`)
+		body, _, errPrep := PrepareBody(src, cfg, resolved)
+		if errPrep != nil {
+			t.Fatalf("%s: PrepareBody: %v", name, errPrep)
+		}
+		var got map[string]any
+		if errJSON := json.Unmarshal(body, &got); errJSON != nil {
+			t.Fatalf("%s: decode body: %v", name, errJSON)
+		}
+		toolList, _ := got["tools"].([]any)
+		if name == "无名工具跳过" {
+			if len(toolList) != 0 {
+				t.Errorf("%s: tools 应为空, got %v", name, got["tools"])
+			}
+			continue
+		}
+		if len(toolList) != 1 {
+			t.Fatalf("%s: tools 长度 = %d, want 1", name, len(toolList))
+		}
+		tool, _ := toolList[0].(map[string]any)
+		fn, _ := tool["function"].(map[string]any)
+		tc.check(t, fn)
 	}
 }
 

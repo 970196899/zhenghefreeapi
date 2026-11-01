@@ -266,32 +266,47 @@ func PrepareBody(src []byte, cfg Config, resolved ResolvedModel) ([]byte, string
 	delete(obj, "model")
 	delete(obj, "function")
 
-	// 归一化 tools 数组：OpenAI 风格的 [{type: "function", function: {...}}] 转为 Trae 扁平格式 [{name: "...", parameters: {...}}]
+	// 归一化 tools 数组为 Trae 上游契约：保持嵌套结构
+	// {type: "function", function: {name, description, parameters: <JSON字符串>}}。
+	// 上游 Go 后端把 parameters 按 string 反序列化（2026-11-01 抓包实证）：
+	// 传 JSON 对象会被判无工具签名或直接 400；缺失时补默认空对象字符串。
 	if rawTools, ok := obj["tools"].([]any); ok && len(rawTools) > 0 {
 		normalized := make([]any, 0, len(rawTools))
 		for _, item := range rawTools {
 			toolMap, isMap := item.(map[string]any)
-			if !isMap {
+			if !isMap || len(toolMap) == 0 {
 				continue
 			}
-			// 如果包含嵌套的 function 对象，将其属性提升到顶层并丢弃 type 包装
-			if fnObj, hasFn := toolMap["function"].(map[string]any); hasFn && fnObj != nil {
-				flatTool := make(map[string]any, len(fnObj)+len(toolMap))
-				// 复制其他可能存在的辅助字段（如 strict 等）
-				for k, v := range toolMap {
-					if k != "type" && k != "function" {
-						flatTool[k] = v
-					}
-				}
-				// 覆盖 function 内部的核心字段（name, description, parameters）
-				for k, v := range fnObj {
-					flatTool[k] = v
-				}
-				normalized = append(normalized, flatTool)
-			} else {
-				// 已经为扁平格式，直接保留
-				normalized = append(normalized, toolMap)
+			fnObj, hasFn := toolMap["function"].(map[string]any)
+			if !hasFn || fnObj == nil {
+				fnObj = toolMap // 兼容扁平输入
 			}
+			name, _ := fnObj["name"].(string)
+			if strings.TrimSpace(name) == "" {
+				continue
+			}
+			description, _ := fnObj["description"].(string)
+
+			var paramsStr string
+			if p, hasP := fnObj["parameters"]; hasP && p != nil {
+				if s, isStr := p.(string); isStr {
+					paramsStr = s // 已是字符串，原样透传
+				} else if raw, errMarshal := json.Marshal(p); errMarshal == nil {
+					paramsStr = string(raw)
+				}
+			}
+			if paramsStr == "" {
+				paramsStr = `{"type":"object","properties":{}}`
+			}
+
+			normalized = append(normalized, map[string]any{
+				"type": "function",
+				"function": map[string]any{
+					"name":        name,
+					"description": description,
+					"parameters":  paramsStr,
+				},
+			})
 		}
 		obj["tools"] = normalized
 	}
