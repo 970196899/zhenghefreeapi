@@ -85,6 +85,23 @@ func (c *catalogCache) resolve(ctx context.Context, model string, cfg Config, cr
 	return ResolvedModel{}, fmt.Errorf("模型 %s 不在该账号的可用目录中", requested)
 }
 
+// standardEfforts 是对外统一宣告的标准思考档位（低→高）。
+// 只读切片，多个 Model 共享底层数组；严禁任何调用方原地 append 或修改元素。
+var standardEfforts = []string{"low", "medium", "high", "xhigh", "max"}
+
+// nativeEffortToStandard 把 Trae 原生默认档映射为标准档。
+// 未知值/空串回落 high——宁可靠近中位强度，也不丢默认档宣告。
+func nativeEffortToStandard(level string) string {
+	switch level {
+	case "light":
+		return "low"
+	case "extra_high":
+		return "xhigh"
+	default:
+		return "high"
+	}
+}
+
 // load 读取账号的模型目录缓存；过期则重新拉取，拉取失败沿用旧条目。
 //
 // 缓存键带上 function 与构建号：目录内容由这两者共同决定，只按账号缓存会在
@@ -126,9 +143,9 @@ func catalogEntries(items []catalogItem) (map[string]ResolvedModel, map[string]M
 		models[strings.ToLower(name)] = ResolvedModel{ConfigName: name, WireName: wire}
 		var efforts []string
 		var defaultEffort string
-		if item.ReasoningEffortConfig != nil {
-			efforts = item.ReasoningEffortConfig.Options
-			defaultEffort = item.ReasoningEffortConfig.DefaultLevel
+		if cfg := item.ReasoningEffortConfig; cfg != nil && len(cfg.Options) > 0 {
+			efforts = standardEfforts
+			defaultEffort = nativeEffortToStandard(strings.ToLower(strings.TrimSpace(cfg.DefaultLevel)))
 		}
 		metadata[name] = Model{
 			ID:            name,
