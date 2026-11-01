@@ -386,9 +386,18 @@ func consumptionRate(raw json.RawMessage) string {
 }
 
 // decodeObject 把 JSON 解成键值对表；空值/非对象返回 false。
+//
+// 上游有时把整个对象下发成带引号转义的 JSON 字符串，首字节是引号时
+// 先解一层再当对象解；解不出合法对象时走原路失败。
 func decodeObject(raw json.RawMessage) (map[string]json.RawMessage, bool) {
 	if len(raw) == 0 || string(raw) == "null" {
 		return nil, false
+	}
+	if trimmed := strings.TrimSpace(string(raw)); strings.HasPrefix(trimmed, `"`) {
+		var unquoted string
+		if errUnquote := json.Unmarshal(raw, &unquoted); errUnquote == nil {
+			raw = json.RawMessage(unquoted)
+		}
 	}
 	var doc map[string]json.RawMessage
 	if errDoc := json.Unmarshal(raw, &doc); errDoc != nil || doc == nil {
