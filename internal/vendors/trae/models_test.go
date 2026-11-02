@@ -152,6 +152,7 @@ func TestCatalogEntriesMapsEffortsToStandard(t *testing.T) {
 		{"未知档位原样小写保留", "light", []string{"light", "ultra"}, []string{"low", "ultra"}, "low"},
 		{"默认档为空回落high", "", []string{"light", "high"}, []string{"low", "high"}, "high"},
 		{"默认档未知回落high", "ultra", []string{"light", "high"}, []string{"low", "high"}, "high"},
+		{"options全空串与无配置等价", "high", []string{"", "   "}, nil, ""},
 	}
 	for _, tc := range cases {
 		opts := make([]string, len(tc.options))
@@ -186,7 +187,11 @@ func TestCatalogEntriesMapsEffortsToStandard(t *testing.T) {
 	 {"config_name":"empty-opts","config_switch":true,"usage":"chat_completion",
 	  "display_config":{"display_name":"Empty"},
 	  "reasoning_effort_config":{"default_level":"light","options":[]},
-	  "model_detail_list":[{"model_name":"empty__dev","max_tokens":4096}]}]}`
+	  "model_detail_list":[{"model_name":"empty__dev","max_tokens":4096}]},
+	 {"config_name":"empty-str","config_switch":true,"usage":"chat_completion",
+	  "display_config":{"display_name":"EmptyStr"},
+	  "reasoning_effort_config":{"default_level":"high","options":["",""]},
+	  "model_detail_list":[{"model_name":"empty_str__dev","max_tokens":4096}]}]}`
 	var parsed catalogResponse
 	if err := json.Unmarshal([]byte(body), &parsed); err != nil {
 		t.Fatalf("解析响应失败: %v", err)
@@ -201,5 +206,10 @@ func TestCatalogEntriesMapsEffortsToStandard(t *testing.T) {
 	empty := metadata["empty-opts"]
 	if empty.Efforts != nil {
 		t.Fatalf("Options 为空时不应宣告档位: %v", empty.Efforts)
+	}
+
+	emptyStr := metadata["empty-str"]
+	if emptyStr.Efforts != nil || emptyStr.DefaultEffort != "" {
+		t.Fatalf("options 全空串的条目被污染: Efforts=%v DefaultEffort=%q", emptyStr.Efforts, emptyStr.DefaultEffort)
 	}
 }
