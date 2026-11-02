@@ -18,6 +18,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -85,21 +86,42 @@ func (c *catalogCache) resolve(ctx context.Context, model string, cfg Config, cr
 	return ResolvedModel{}, fmt.Errorf("模型 %s 不在该账号的可用目录中", requested)
 }
 
-// standardEfforts 是对外统一宣告的标准思考档位（低→高）。
-// 只读切片，多个 Model 共享底层数组；严禁任何调用方原地 append 或修改元素。
-var standardEfforts = []string{"low", "medium", "high", "xhigh", "max"}
-
-// nativeEffortToStandard 把 Trae 原生默认档映射为标准档。
-// 未知值/空串回落 high——宁可靠近中位强度，也不丢默认档宣告。
+// nativeEffortToStandard 把 Trae 原生档位映射为标准通用档位名。
+// 未知值原样小写保留——上游新增档位时不静默丢弃，交由展示层兜底。
 func nativeEffortToStandard(level string) string {
+	level = strings.ToLower(strings.TrimSpace(level))
 	switch level {
 	case "light":
 		return "low"
 	case "extra_high":
-		return "xhigh"
-	default:
+		return "max"
+	case "high":
 		return "high"
+	default:
+		return level
 	}
+}
+
+// nativeOptionsToStandard 将上游原生 options 数组逐项精准映射为标准档位，保持顺序并去重。
+// 映射结果全空（空数组或各项均为空白）时返回 nil——与无档位配置等价，不虚假宣告。
+func nativeOptionsToStandard(raw []string) []string {
+	if len(raw) == 0 {
+		return nil
+	}
+	out := make([]string, 0, len(raw))
+	seen := make(map[string]bool, len(raw))
+	for _, item := range raw {
+		std := nativeEffortToStandard(item)
+		if std == "" || seen[std] {
+			continue
+		}
+		seen[std] = true
+		out = append(out, std)
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
 }
 
 // load 读取账号的模型目录缓存；过期则重新拉取，拉取失败沿用旧条目。
@@ -144,8 +166,17 @@ func catalogEntries(items []catalogItem) (map[string]ResolvedModel, map[string]M
 		var efforts []string
 		var defaultEffort string
 		if cfg := item.ReasoningEffortConfig; cfg != nil && len(cfg.Options) > 0 {
-			efforts = standardEfforts
-			defaultEffort = nativeEffortToStandard(strings.ToLower(strings.TrimSpace(cfg.DefaultLevel)))
+			efforts = nativeOptionsToStandard(cfg.Options)
+			if efforts == nil {
+				// options 全空串与无配置等价：不宣告档位，默认档也不虚构。
+				defaultEffort = ""
+			} else {
+				defaultEffort = nativeEffortToStandard(cfg.DefaultLevel)
+				if !slices.Contains([]string{"low", "high", "max"}, defaultEffort) {
+					// 宿主只消费 DefaultEffort 非空性；未知/空默认档回落 high 防逗值。
+					defaultEffort = "high"
+				}
+			}
 		}
 		metadata[name] = Model{
 			ID:            name,
