@@ -1,12 +1,18 @@
 package qoder
 
 import (
+	"context"
+	"encoding/json"
+	"fmt"
 	"io"
-	"reflect"
 	"net/http"
 	"net/http/httptest"
+	"reflect"
 	"strings"
 	"testing"
+
+	"freetier2api-plugin/cpasdk/pluginabi"
+	"freetier2api-plugin/internal/hostbridge"
 )
 
 func TestReadQoderResponseBodyLimit(t *testing.T) {
@@ -295,5 +301,127 @@ func TestFloatPtrStringTolerance(t *testing.T) {
 		if got != nil && c.want != nil && *got != *c.want {
 			t.Errorf("%s: FloatPtr = %v, want %v", c.name, *got, *c.want)
 		}
+	}
+}
+
+// ---- 出站思考意图（用户决断：推理模型默认开启，显式关闭优先）----
+
+func TestDecodeChatRequestReasoningIntent(t *testing.T) {
+	cases := []struct {
+		name         string
+		payload      string
+		wantEnabled  bool
+		wantDisabled bool
+		wantMaxToken int
+	}{
+		{"reasoning_effort开启", `{"model":"dmodel","messages":[],"reasoning_effort":"high"}`, true, false, 0},
+		{"thinking_enabled开启", `{"model":"dmodel","messages":[],"thinking":{"type":"enabled"}}`, true, false, 0},
+		{"驼峰键同效", `{"model":"dmodel","messages":[],"reasoningEffort":"max"}`, true, false, 0},
+		{"显式关闭压过开启", `{"model":"dmodel","messages":[],"reasoning_effort":"high","thinking":{"type":"disabled"}}`, false, true, 0},
+		{"无参数两信号均false", `{"model":"dmodel","messages":[]}`, false, false, 0},
+		{"max_tokens接线", `{"model":"dmodel","messages":[],"max_tokens":2048}`, false, false, 2048},
+	}
+	for _, c := range cases {
+		req, err := decodeChatRequest([]byte(c.payload))
+		if err != nil {
+			t.Fatalf("%s: decodeChatRequest: %v", c.name, err)
+		}
+		if req.ReasoningEnabled != c.wantEnabled || req.ReasoningDisabled != c.wantDisabled {
+			t.Errorf("%s: 显式信号 = (%v,%v), want (%v,%v)", c.name,
+				req.ReasoningEnabled, req.ReasoningDisabled, c.wantEnabled, c.wantDisabled)
+		}
+		if req.MaxTokens != c.wantMaxToken {
+			t.Errorf("%s: MaxTokens = %d, want %d", c.name, req.MaxTokens, c.wantMaxToken)
+		}
+	}
+}
+
+// captureQoderOutbound 装上有界假宿主（最多 3 次 stream_read，之后强制 done），
+// 捕获并解密一次出站请求体，供断言 model_config 使用。
+func captureQoderOutbound(t *testing.T, b *Bridge, payload string) map[string]interface{} {
+	t.Helper()
+	var captured map[string]interface{}
+	reads := 0
+	hostbridge.Configure(func(callbackID, method string, req any) (json.RawMessage, error) {
+		switch method {
+		case pluginabi.MethodHostHTTPDoStream:
+			raw, _ := json.Marshal(req)
+			var envelope struct {
+				Body string `json:"body"`
+			}
+			if err := json.Unmarshal(raw, &envelope); err != nil {
+				return nil, err
+			}
+			plain, errDecode := Decode(envelope.Body)
+			if errDecode != nil {
+				return nil, errDecode
+			}
+			if err := json.Unmarshal(plain, &captured); err != nil {
+				return nil, err
+			}
+			return json.Marshal(map[string]any{
+				"status_code": 200,
+				"headers":     map[string][]string{"Content-Type": {"text/event-stream"}},
+				"stream_id":   "stub-stream",
+			})
+		case pluginabi.MethodHostHTTPStreamRead:
+			reads++
+			if reads > 3 {
+				t.Fatal("stream_read 超过有界阈值 3 次，测试桩未脱出")
+			}
+			return json.Marshal(map[string]any{"done": true})
+		case pluginabi.MethodHostHTTPStreamClose:
+			return json.Marshal(map[string]any{})
+		default:
+			return nil, fmt.Errorf("stub host: unsupported method %s", method)
+		}
+	})
+	if err := StreamChatCompletions(context.Background(), b, []byte(payload), func([]byte) error { return nil }); err != nil {
+		t.Fatalf("StreamChatCompletions: %v", err)
+	}
+	if captured == nil {
+		t.Fatal("未捕获到出站请求体")
+	}
+	return captured
+}
+
+func TestOutboundIsReasoningPassthrough(t *testing.T) {
+	sess, errSess := NewSession(AuthIdentity{Name: "tester", Uid: "u-1"}, "mid", "mtoken", "pc")
+	if errSess != nil {
+		t.Fatalf("NewSession: %v", errSess)
+	}
+	tpl, errTpl := TemplateBase()
+	if errTpl != nil {
+		t.Fatalf("TemplateBase: %v", errTpl)
+	}
+	var index modelIndex
+	index.replace([]Model{
+		{Key: "dmodel", DisplayName: "DeepSeek-V4-Pro", IsReasoning: true},
+		{Key: "gmodel", DisplayName: "GLM-5.3"},
+	})
+
+	cases := []struct {
+		name       string
+		payload    string
+		wantReason bool
+	}{
+		{"推理模型无参数默认开启", `{"model":"deepseek-v4-pro","stream":true,"messages":[{"role":"user","content":"hi"}]}`, true},
+		{"推理模型显式关闭", `{"model":"deepseek-v4-pro","stream":true,"messages":[{"role":"user","content":"hi"}],"thinking":{"type":"disabled"}}`, false},
+		{"非推理模型无参数不误开", `{"model":"glm-5.3","stream":true,"messages":[{"role":"user","content":"hi"}]}`, false},
+		{"非推理模型显式开启", `{"model":"glm-5.3","stream":true,"messages":[{"role":"user","content":"hi"}],"reasoning_effort":"high"}`, true},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			b := &Bridge{sess: sess, client: NewBearerClient(sess), region: RegionCN, templateBase: tpl, models: &index}
+			body := captureQoderOutbound(t, b, c.payload)
+			mc, _ := body["model_config"].(map[string]interface{})
+			if mc == nil {
+				t.Fatalf("出站体缺 model_config: %v", body)
+			}
+			got, _ := mc["is_reasoning"].(bool)
+			if got != c.wantReason {
+				t.Errorf("model_config.is_reasoning = %v, want %v", got, c.wantReason)
+			}
+		})
 	}
 }
