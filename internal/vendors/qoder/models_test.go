@@ -4,6 +4,7 @@ import (
 	"reflect"
 	"testing"
 
+	"freetier2api-plugin/cpasdk/pluginapi"
 	"freetier2api-plugin/internal/core"
 )
 
@@ -234,19 +235,22 @@ func TestModelsToPluginAPIPassesEfforts(t *testing.T) {
 		{Key: "gmodel", DisplayName: "GLM-5.3"},
 	}
 	registered := adapterInstance.modelsToPluginAPI(models)
-	byID := make(map[string]core.ModelDescriptor, len(registered))
+	byID := make(map[string]pluginapi.ModelInfo, len(registered))
 	for _, model := range registered {
 		byID[model.ID] = model
 	}
 	got := byID["deepseek-v4-pro"]
-	if !reflect.DeepEqual(got.Efforts, []string{"low", "medium", "high", "max"}) {
-		t.Errorf("推理模型 Efforts = %v, want [low medium high max]", got.Efforts)
+	if got.Thinking == nil {
+		t.Fatal("推理模型未宣告 Thinking 支持")
 	}
-	if got.DefaultEffort != "high" {
-		t.Errorf("推理模型 DefaultEffort = %q, want high", got.DefaultEffort)
+	if !reflect.DeepEqual(got.Thinking.Levels, []string{"low", "medium", "high", "max"}) {
+		t.Errorf("推理模型 Levels = %v, want [low medium high max]", got.Thinking.Levels)
 	}
-	if plain := byID["glm-5.3"]; len(plain.Efforts) != 0 || plain.DefaultEffort != "" {
-		t.Errorf("非推理模型被误宣告档位: Efforts=%v DefaultEffort=%q", plain.Efforts, plain.DefaultEffort)
+	if !got.Thinking.DynamicAllowed {
+		t.Error("推理模型 DynamicAllowed = false, want true（DefaultEffort 非空）")
+	}
+	if plain := byID["glm-5.3"]; plain.Thinking != nil {
+		t.Errorf("非推理模型被误宣告档位: Thinking=%+v", plain.Thinking)
 	}
 }
 
