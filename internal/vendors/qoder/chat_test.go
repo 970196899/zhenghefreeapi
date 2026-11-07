@@ -369,6 +369,10 @@ func captureQoderOutbound(t *testing.T, b *Bridge, payload string) map[string]in
 			if reads > 3 {
 				t.Fatal("stream_read 超过有界阈值 3 次，测试桩未脱出")
 			}
+			if reads == 1 {
+				frame := `data:{"statusCodeValue":200,"body":"{\"choices\":[{\"delta\":{\"content\":\"ok\"}}]}"}` + "\n\n"
+				return json.Marshal(map[string]any{"payload": []byte(frame)})
+			}
 			return json.Marshal(map[string]any{"done": true})
 		case pluginabi.MethodHostHTTPStreamClose:
 			return json.Marshal(map[string]any{})
