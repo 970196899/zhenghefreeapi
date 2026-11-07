@@ -228,10 +228,10 @@ func TestExtractModelsPrefers1MContext(t *testing.T) {
 			},
 		}, 1000000},
 		{"无context_config回退max_input_tokens", map[string]interface{}{
-			"key": "c", "display_name": "C", "enable": true, "max_input_tokens": 200000,
+			"key": "c", "display_name": "C", "enable": true, "max_input_tokens": float64(200000),
 		}, 200000},
 		{"大值不被1M压低", map[string]interface{}{
-			"key": "d", "display_name": "D", "enable": true, "max_input_tokens": 1500000,
+			"key": "d", "display_name": "D", "enable": true, "max_input_tokens": float64(1500000),
 		}, 1500000},
 		{"全缺底线兜底1M", map[string]interface{}{"key": "e", "display_name": "E", "enable": true}, 1000000},
 	}
