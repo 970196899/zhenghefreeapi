@@ -59,7 +59,12 @@ func RunChatCompletions(b *Bridge, payload []byte, w io.Writer) error {
 	var content strings.Builder
 	var toolCallBuf []interface{}
 	var inputTokens, outputTokens int
-	errCall := b.CallQoder(context.Background(), InferAgent(req.Model), messages, req.Model, req.Tools, func(d Delta) {
+	// 推理模型默认开启深度思考；仅客户端显式声明关闭时才关闭。
+	opts := CallOpts{
+		IsReasoning: !req.ReasoningDisabled && (req.ReasoningEnabled || b.models.IsReasoningModel(req.Model)),
+		MaxTokens:   req.MaxTokens,
+	}
+	errCall := b.CallQoderWithOpts(context.Background(), InferAgent(req.Model), messages, req.Model, req.Tools, opts, func(d Delta) {
 		if d.InputTokens > 0 || d.OutputTokens > 0 {
 			inputTokens, outputTokens = d.InputTokens, d.OutputTokens
 		}
@@ -127,7 +132,12 @@ func StreamChatCompletions(ctx context.Context, b *Bridge, payload []byte, emit 
 	// emitErr 记下客户端侧写失败：SSE 一旦写不出去（浏览器断开、上游连接
 	// 被掐），继续生成只会白烧额度，必须停下来并把错误交给调用方。
 	var emitErr error
-	errCall := b.CallQoder(ctx, InferAgent(req.Model), messages, req.Model, req.Tools, func(d Delta) {
+	// 推理模型默认开启深度思考；仅客户端显式声明关闭时才关闭。
+	opts := CallOpts{
+		IsReasoning: !req.ReasoningDisabled && (req.ReasoningEnabled || b.models.IsReasoningModel(req.Model)),
+		MaxTokens:   req.MaxTokens,
+	}
+	errCall := b.CallQoderWithOpts(ctx, InferAgent(req.Model), messages, req.Model, req.Tools, opts, func(d Delta) {
 		if emitErr != nil {
 			return
 		}
@@ -292,12 +302,15 @@ func cloneToolCall(src map[string]interface{}) map[string]interface{} {
 
 // chatRequest 是一次对话请求的关键字段。
 type chatRequest struct {
-	Model     string
-	Stream    bool
-	Messages  []interface{}
-	Tools     interface{}
-	ToolsUsed bool
-	Prompt    string
+	Model             string
+	Stream            bool
+	Messages          []interface{}
+	Tools             interface{}
+	ToolsUsed         bool
+	Prompt            string
+	ReasoningEnabled  bool // 客户端显式要求思考（reasoning_effort / thinking.enabled）
+	ReasoningDisabled bool // 客户端显式关闭思考（thinking.disabled），优先级最高
+	MaxTokens         int
 }
 
 // decodeChatRequest 解析请求体。
@@ -309,14 +322,38 @@ func decodeChatRequest(payload []byte) (chatRequest, error) {
 	messages, _ := raw["messages"].([]interface{})
 	tools := raw["tools"]
 	stream, _ := raw["stream"].(bool)
+	enabled, disabled := reasoningSignals(raw)
 	return chatRequest{
-		Model:     StrValDefault(raw, "model", "auto"),
-		Stream:    stream,
-		Messages:  messages,
-		Tools:     tools,
-		ToolsUsed: tools != nil,
-		Prompt:    ExtractLatestUserPrompt(messages),
+		Model:             StrValDefault(raw, "model", "auto"),
+		Stream:            stream,
+		Messages:          messages,
+		Tools:             tools,
+		ToolsUsed:         tools != nil,
+		Prompt:            ExtractLatestUserPrompt(messages),
+		ReasoningEnabled:  enabled,
+		ReasoningDisabled: disabled,
+		MaxTokens:         int(FloatVal(raw, "max_tokens")),
 	}, nil
+}
+
+// reasoningSignals 解析客户端的显式思考意向：thinking.type=="disabled" 最高优先，
+// reasoning_effort/reasoningEffort 非空或 thinking.type=="enabled" 表示要求思考。
+// 客户端未表态时两者皆 false，由调用点结合模型属性决定默认行为。
+func reasoningSignals(raw map[string]interface{}) (enabled, disabled bool) {
+	thinking, _ := raw["thinking"].(map[string]interface{})
+	if thinkingType, _ := thinking["type"].(string); strings.EqualFold(thinkingType, "disabled") {
+		return false, true
+	}
+	if effort, ok := raw["reasoning_effort"].(string); ok && strings.TrimSpace(effort) != "" {
+		return true, false
+	}
+	if effort, ok := raw["reasoningEffort"].(string); ok && strings.TrimSpace(effort) != "" {
+		return true, false
+	}
+	if thinkingType, _ := thinking["type"].(string); strings.EqualFold(thinkingType, "enabled") {
+		return true, false
+	}
+	return false, false
 }
 
 func BuildQoderMessages(templateMsgs []interface{}, incoming []interface{}, prompt string, toolsEnabled bool) []interface{} {
