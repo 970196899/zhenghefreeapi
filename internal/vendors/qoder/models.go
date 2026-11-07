@@ -24,8 +24,9 @@ import (
 // 清单的 {key, display_name} 配对里。写死一张表意味着上游每换一个模型就要
 // 改代码，而且容易把两个不同模型误绑到同一个名字；从清单推导则天然跟随上游。
 type modelIndex struct {
-	mu     sync.RWMutex
-	byName map[string]string
+	mu            sync.RWMutex
+	byName        map[string]string
+	reasoningKeys map[string]bool
 }
 
 // replace 用一批上游模型条目重建索引，返回「上游 key → 对外 ID」。
@@ -35,6 +36,7 @@ type modelIndex struct {
 func (i *modelIndex) replace(models []Model) map[string]string {
 	byName := make(map[string]string, len(models)*2)
 	slugByKey := make(map[string]string, len(models))
+	reasoningKeys := make(map[string]bool, len(models))
 	for _, model := range models {
 		key := strings.TrimSpace(model.Key)
 		if key == "" {
@@ -50,6 +52,10 @@ func (i *modelIndex) replace(models []Model) map[string]string {
 		}
 		slugByKey[key] = id
 		byName[id] = key
+		if model.IsReasoning {
+			reasoningKeys[strings.ToLower(id)] = true
+			reasoningKeys[strings.ToLower(key)] = true
+		}
 		// 老客户端仍可能直接发上游 key（dmodel / gmodel …）：一并接受。
 		// 对外 ID 优先——万一某个 slug 恰好等于另一个模型的上游 key，
 		// 以清单里声明的 slug 为准。
@@ -60,8 +66,27 @@ func (i *modelIndex) replace(models []Model) map[string]string {
 	}
 	i.mu.Lock()
 	i.byName = byName
+	i.reasoningKeys = reasoningKeys
 	i.mu.Unlock()
 	return slugByKey
+}
+
+// IsReasoningModel 判断对外模型名（slug 或上游 key）是否指向推理模型。
+// 索引未建立或名称未命中时返回 false；用于「推理模型默认开启深度思考」判定。
+func (i *modelIndex) IsReasoningModel(name string) bool {
+	if i == nil {
+		return false
+	}
+	trimmed := strings.ToLower(strings.TrimSpace(name))
+	if trimmed == "" {
+		return false
+	}
+	i.mu.RLock()
+	defer i.mu.RUnlock()
+	if key, ok := i.byName[trimmed]; ok {
+		trimmed = strings.ToLower(key)
+	}
+	return i.reasoningKeys[trimmed]
 }
 
 // UpstreamKey 把对外模型名解析成上游 model_config.key。大小写不敏感。

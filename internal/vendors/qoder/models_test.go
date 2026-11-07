@@ -1,8 +1,10 @@
 package qoder
 
 import (
+	"reflect"
 	"testing"
 
+	"freetier2api-plugin/cpasdk/pluginapi"
 	"freetier2api-plugin/internal/core"
 )
 
@@ -218,3 +220,64 @@ func TestModelCreditsFromPriceFactor(t *testing.T) {
 
 // float64Ptr 便于在测试里构造「上游显式给了倍率」的模型。
 func float64Ptr(value float64) *float64 { return &value }
+
+// ---- 推理档位透传与 modelIndex 推理属性（Spec 2026-11-07）----
+
+func TestModelsToPluginAPIPassesEfforts(t *testing.T) {
+	instance := newInstance(core.Env{}, RegionCN)
+	adapterInstance, okAdapter := instance.(*adapter)
+	if !okAdapter {
+		t.Fatalf("newInstance returned %T; want *adapter", instance)
+	}
+	models := []Model{
+		{Key: "dmodel", DisplayName: "DeepSeek-V4-Pro", IsReasoning: true,
+			Efforts: []string{"low", "medium", "high", "max"}, DefaultEffort: "high"},
+		{Key: "gmodel", DisplayName: "GLM-5.3"},
+	}
+	registered := adapterInstance.modelsToPluginAPI(models)
+	byID := make(map[string]pluginapi.ModelInfo, len(registered))
+	for _, model := range registered {
+		byID[model.ID] = model
+	}
+	got := byID["deepseek-v4-pro"]
+	if got.Thinking == nil {
+		t.Fatal("推理模型未宣告 Thinking 支持")
+	}
+	if !reflect.DeepEqual(got.Thinking.Levels, []string{"low", "medium", "high", "max"}) {
+		t.Errorf("推理模型 Levels = %v, want [low medium high max]", got.Thinking.Levels)
+	}
+	if !got.Thinking.DynamicAllowed {
+		t.Error("推理模型 DynamicAllowed = false, want true（DefaultEffort 非空）")
+	}
+	if plain := byID["glm-5.3"]; plain.Thinking != nil {
+		t.Errorf("非推理模型被误宣告档位: Thinking=%+v", plain.Thinking)
+	}
+}
+
+func TestModelIndexIsReasoningModel(t *testing.T) {
+	var index modelIndex
+	index.replace([]Model{
+		{Key: "dmodel", DisplayName: "DeepSeek-V4-Pro", IsReasoning: true},
+		{Key: "gmodel", DisplayName: "GLM-5.3"},
+	})
+	cases := []struct {
+		name string
+		arg  string
+		want bool
+	}{
+		{"对外slug", "deepseek-v4-pro", true},
+		{"上游key", "dmodel", true},
+		{"大小写混排", "DeepSeek-V4-Pro", true},
+		{"非推理模型", "glm-5.3", false},
+		{"未知模型", "no-such-model", false},
+	}
+	for _, c := range cases {
+		if got := index.IsReasoningModel(c.arg); got != c.want {
+			t.Errorf("%s: IsReasoningModel(%q) = %v, want %v", c.name, c.arg, got, c.want)
+		}
+	}
+	var nilIndex *modelIndex
+	if nilIndex.IsReasoningModel("anything") {
+		t.Error("nil 索引必须安全返回 false")
+	}
+}

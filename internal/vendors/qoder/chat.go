@@ -59,7 +59,12 @@ func RunChatCompletions(b *Bridge, payload []byte, w io.Writer) error {
 	var content strings.Builder
 	var toolCallBuf []interface{}
 	var inputTokens, outputTokens int
-	errCall := b.CallQoder(context.Background(), InferAgent(req.Model), messages, req.Model, req.Tools, func(d Delta) {
+	// 推理模型默认开启深度思考；仅客户端显式声明关闭时才关闭。
+	opts := CallOpts{
+		IsReasoning: !req.ReasoningDisabled && (req.ReasoningEnabled || b.models.IsReasoningModel(req.Model)),
+		MaxTokens:   req.MaxTokens,
+	}
+	errCall := b.CallQoderWithOpts(context.Background(), InferAgent(req.Model), messages, req.Model, req.Tools, opts, func(d Delta) {
 		if d.InputTokens > 0 || d.OutputTokens > 0 {
 			inputTokens, outputTokens = d.InputTokens, d.OutputTokens
 		}
@@ -127,7 +132,12 @@ func StreamChatCompletions(ctx context.Context, b *Bridge, payload []byte, emit 
 	// emitErr 记下客户端侧写失败：SSE 一旦写不出去（浏览器断开、上游连接
 	// 被掐），继续生成只会白烧额度，必须停下来并把错误交给调用方。
 	var emitErr error
-	errCall := b.CallQoder(ctx, InferAgent(req.Model), messages, req.Model, req.Tools, func(d Delta) {
+	// 推理模型默认开启深度思考；仅客户端显式声明关闭时才关闭。
+	opts := CallOpts{
+		IsReasoning: !req.ReasoningDisabled && (req.ReasoningEnabled || b.models.IsReasoningModel(req.Model)),
+		MaxTokens:   req.MaxTokens,
+	}
+	errCall := b.CallQoderWithOpts(ctx, InferAgent(req.Model), messages, req.Model, req.Tools, opts, func(d Delta) {
 		if emitErr != nil {
 			return
 		}
@@ -292,12 +302,15 @@ func cloneToolCall(src map[string]interface{}) map[string]interface{} {
 
 // chatRequest 是一次对话请求的关键字段。
 type chatRequest struct {
-	Model     string
-	Stream    bool
-	Messages  []interface{}
-	Tools     interface{}
-	ToolsUsed bool
-	Prompt    string
+	Model             string
+	Stream            bool
+	Messages          []interface{}
+	Tools             interface{}
+	ToolsUsed         bool
+	Prompt            string
+	ReasoningEnabled  bool // 客户端显式要求思考（reasoning_effort / thinking.enabled）
+	ReasoningDisabled bool // 客户端显式关闭思考（thinking.disabled），优先级最高
+	MaxTokens         int
 }
 
 // decodeChatRequest 解析请求体。
@@ -309,14 +322,38 @@ func decodeChatRequest(payload []byte) (chatRequest, error) {
 	messages, _ := raw["messages"].([]interface{})
 	tools := raw["tools"]
 	stream, _ := raw["stream"].(bool)
+	enabled, disabled := reasoningSignals(raw)
 	return chatRequest{
-		Model:     StrValDefault(raw, "model", "auto"),
-		Stream:    stream,
-		Messages:  messages,
-		Tools:     tools,
-		ToolsUsed: tools != nil,
-		Prompt:    ExtractLatestUserPrompt(messages),
+		Model:             StrValDefault(raw, "model", "auto"),
+		Stream:            stream,
+		Messages:          messages,
+		Tools:             tools,
+		ToolsUsed:         tools != nil,
+		Prompt:            ExtractLatestUserPrompt(messages),
+		ReasoningEnabled:  enabled,
+		ReasoningDisabled: disabled,
+		MaxTokens:         int(FloatVal(raw, "max_tokens")),
 	}, nil
+}
+
+// reasoningSignals 解析客户端的显式思考意向：thinking.type=="disabled" 最高优先，
+// reasoning_effort/reasoningEffort 非空或 thinking.type=="enabled" 表示要求思考。
+// 客户端未表态时两者皆 false，由调用点结合模型属性决定默认行为。
+func reasoningSignals(raw map[string]interface{}) (enabled, disabled bool) {
+	thinking, _ := raw["thinking"].(map[string]interface{})
+	if thinkingType, _ := thinking["type"].(string); strings.EqualFold(thinkingType, "disabled") {
+		return false, true
+	}
+	if effort, ok := raw["reasoning_effort"].(string); ok && strings.TrimSpace(effort) != "" {
+		return true, false
+	}
+	if effort, ok := raw["reasoningEffort"].(string); ok && strings.TrimSpace(effort) != "" {
+		return true, false
+	}
+	if thinkingType, _ := thinking["type"].(string); strings.EqualFold(thinkingType, "enabled") {
+		return true, false
+	}
+	return false, false
 }
 
 func BuildQoderMessages(templateMsgs []interface{}, incoming []interface{}, prompt string, toolsEnabled bool) []interface{} {
@@ -1320,12 +1357,17 @@ func FloatVal(m map[string]interface{}, key string) float64 {
 }
 
 // FloatPtr 取可选数值：缺字段返回 nil，显式 0 返回指向 0 的指针。
+// 兼容上游把倍率下发给字符串（"1.0"）的情形，非数字字符串按缺失处理。
 func FloatPtr(m map[string]interface{}, key string) *float64 {
-	v, ok := m[key].(float64)
-	if !ok {
-		return nil
+	if v, ok := m[key].(float64); ok {
+		return &v
 	}
-	return &v
+	if s, ok := m[key].(string); ok {
+		if f, errParse := strconv.ParseFloat(strings.TrimSpace(s), 64); errParse == nil {
+			return &f
+		}
+	}
+	return nil
 }
 
 const (
@@ -1498,6 +1540,9 @@ type Model struct {
 	MaxInputTokens  int    `json:"max_input_tokens,omitempty"`
 	// PriceFactor 是上游计费倍率；用指针区分「没给」与「显式 0」（限免）。
 	PriceFactor *float64 `json:"price_factor,omitempty"`
+	// Efforts/DefaultEffort 仅推理模型宣告，供控制台档位选择器使用。
+	Efforts       []string `json:"efforts,omitempty"`
+	DefaultEffort string   `json:"default_effort,omitempty"`
 }
 
 // NewBridge 创建 API 转换桥接。
@@ -1594,17 +1639,84 @@ func (b *Bridge) ListAvailableModels(ctx context.Context) ([]Model, error) {
 	return models, nil
 }
 
+// parseModels 全量合并上游所有模型分类：已知三分类按固定顺序在前，其余
+// 顶层数组按键名升序追加；同一 Key 保留配置更完整（上下文更大/补齐倍率）者。
 func parseModels(resp map[string]interface{}) []Model {
-	// 按优先级尝试多个分类
 	categories := []string{"assistant", "developer", "chat"}
-	for _, cat := range categories {
-		rawList, _ := resp[cat].([]interface{})
-		out := extractModels(rawList)
-		if len(out) > 0 {
-			return out
+	var all []Model
+	seen := make(map[string]int)
+
+	appendList := func(raw interface{}) {
+		rawList, ok := raw.([]interface{})
+		if !ok {
+			return
+		}
+		for _, item := range extractModels(rawList) {
+			if item.Key == "" {
+				continue
+			}
+			if idx, exists := seen[item.Key]; exists {
+				// 择优替换：上下文更大，或旧条目缺倍率而新条目带倍率。
+				if item.ContextWindow > all[idx].ContextWindow ||
+					(all[idx].PriceFactor == nil && item.PriceFactor != nil) {
+					all[idx] = item
+				}
+				continue
+			}
+			seen[item.Key] = len(all)
+			all = append(all, item)
 		}
 	}
-	return nil
+
+	for _, cat := range categories {
+		appendList(resp[cat])
+	}
+	var extraKeys []string
+	for key, val := range resp {
+		if key == "assistant" || key == "developer" || key == "chat" {
+			continue
+		}
+		if _, ok := val.([]interface{}); ok {
+			extraKeys = append(extraKeys, key)
+		}
+	}
+	sort.Strings(extraKeys)
+	for _, key := range extraKeys {
+		appendList(resp[key])
+	}
+	return all
+}
+
+// maxContextTokens 从 context_config 取所有档位里最大的 token_count，
+// 兼容「对象包数组」与「裸数组」两种上游形态；取不到返回 0。
+func maxContextTokens(m map[string]interface{}) int {
+	maxTokens := 0
+	scan := func(cfg interface{}) {
+		cfgMap, ok := cfg.(map[string]interface{})
+		if !ok {
+			return
+		}
+		if tokens := int(FloatVal(cfgMap, "token_count")); tokens > maxTokens {
+			maxTokens = tokens
+		}
+	}
+	switch cc := m["context_config"].(type) {
+	case map[string]interface{}:
+		for _, val := range cc {
+			if list, ok := val.([]interface{}); ok {
+				for _, cfg := range list {
+					scan(cfg)
+				}
+			} else {
+				scan(val)
+			}
+		}
+	case []interface{}:
+		for _, cfg := range cc {
+			scan(cfg)
+		}
+	}
+	return maxTokens
 }
 
 func extractModels(rawList []interface{}) []Model {
@@ -1615,49 +1727,34 @@ func extractModels(rawList []interface{}) []Model {
 			continue
 		}
 		enable, _ := m["enable"].(bool)
+		isReasoning := func() bool { v, _ := m["is_reasoning"].(bool); return v }()
 		model := Model{
 			Key:            StrVal(m, "key"),
 			DisplayName:    StrVal(m, "display_name"),
 			Enable:         enable,
 			IsDefault:      func() bool { v, _ := m["is_default"].(bool); return v }(),
-			IsReasoning:    func() bool { v, _ := m["is_reasoning"].(bool); return v }(),
+			IsReasoning:    isReasoning,
 			MaxInputTokens: int(FloatVal(m, "max_input_tokens")),
 			PriceFactor:    FloatPtr(m, "price_factor"),
 		}
-		if cc, ok := m["context_config"].(map[string]interface{}); ok {
-			var defaultCfg map[string]interface{}
-			for _, cfg := range cc {
-				cfgMap, _ := cfg.(map[string]interface{})
-				if cfgMap == nil {
-					continue
-				}
-				isDefault, _ := cfgMap["is_default"].(bool)
-				if isDefault {
-					defaultCfg = cfgMap
-					break
-				}
-			}
-			if defaultCfg == nil {
-				for _, cfg := range cc {
-					cfgMap, _ := cfg.(map[string]interface{})
-					if cfgMap != nil {
-						defaultCfg = cfgMap
-						break
-					}
-				}
-			}
-			if defaultCfg != nil {
-				model.ContextWindow = int(FloatVal(defaultCfg, "token_count"))
-			}
+		if !isReasoning {
+			// 上游偶尔不给 is_reasoning，用名称特征串兜底识别推理模型。
+			name := strings.ToLower(model.DisplayName + "/" + model.Key)
+			isReasoning = strings.Contains(name, "reasoning")
+			model.IsReasoning = isReasoning
 		}
+		// 择优取所有上下文档位的最大上限（1M 旗舰档优先于默认 195K）。
+		model.ContextWindow = maxContextTokens(m)
 		if model.ContextWindow == 0 {
 			model.ContextWindow = model.MaxInputTokens
 		}
 		if model.ContextWindow == 0 {
-			model.ContextWindow = model.MaxInputTokens
+			model.ContextWindow = 1000000
 		}
-		if model.IsReasoning {
+		if isReasoning {
 			model.MaxOutputTokens = 32768
+			model.Efforts = []string{"low", "medium", "high", "max"}
+			model.DefaultEffort = "high"
 		} else {
 			model.MaxOutputTokens = 16384
 		}
