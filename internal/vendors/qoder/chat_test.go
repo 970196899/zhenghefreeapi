@@ -347,12 +347,12 @@ func captureQoderOutbound(t *testing.T, b *Bridge, payload string) map[string]in
 		case pluginabi.MethodHostHTTPDoStream:
 			raw, _ := json.Marshal(req)
 			var envelope struct {
-				Body string `json:"body"`
+				Body []byte `json:"body"`
 			}
 			if err := json.Unmarshal(raw, &envelope); err != nil {
 				return nil, err
 			}
-			plain, errDecode := Decode(envelope.Body)
+			plain, errDecode := Decode(string(envelope.Body))
 			if errDecode != nil {
 				return nil, errDecode
 			}
